@@ -36,7 +36,7 @@ int exclisive_or_alltoallv(char *sendbuf, int *sendcounts,
     MPI_Type_size(recvtype, &rdtype_size);
 
     MPI_Type_get_extent(sendtype, &slb, &sext);
-    MPI_Type_get_extent(sendtype, &rlb, &rext);
+    MPI_Type_get_extent(recvtype, &rlb, &rext);
 
     for (step = 0; step < size; step++) {
     	src = dst = rank ^ step;
