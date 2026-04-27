@@ -115,6 +115,8 @@ static void execute_transfers(ServletContext *ctx) {
         post_start = MPI_Wtime();
     }
 
+    // todo: only captures time after last batch finishes
+    // capture actual MPI_Testsome loop time
     ctx->progress_time = MPI_Wtime() - post_start;
 
     free(reqs);
