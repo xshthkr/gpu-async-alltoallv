@@ -55,10 +55,19 @@ static void wait_slot_available(ServletSlot *slot) {
 }
 
 /*
-ensure the slot has enough send buffer and sizes storage for ngroup groups
-resizes only when current capacity is insufficient
+ensure the slot has enough capacity for all heap-owned buffers:
+- send_buffer: phase 2 send payload
+- sizes_storage: per-node send/recv sizes and displacements
+- extra_buffer: phase 1 bruck intermediate storage
+- temp_recv_buffer: phase 1 bruck receive scratch
+
+only reallocates when current capacity is insufficient
+in steady-state loops (same n, nprocs, msg_size), zero allocations
 */
-static void ensure_slot_capacity(ServletSlot *slot, size_t send_bytes, int ngroup) {
+static void ensure_slot_capacity(
+	ServletSlot *slot, size_t send_bytes, int ngroup,
+	size_t extra_bytes, size_t temp_recv_bytes)
+{
 	if (send_bytes > slot->send_buffer_capacity) {
 		if (slot->send_buffer) free(slot->send_buffer);
 		slot->send_buffer = (char*) malloc(send_bytes);
@@ -68,6 +77,16 @@ static void ensure_slot_capacity(ServletSlot *slot, size_t send_bytes, int ngrou
 		if (slot->sizes_storage) free(slot->sizes_storage);
 		slot->sizes_storage = (int*) malloc(4 * ngroup * sizeof(int));
 		slot->sizes_ngroup = ngroup;
+	}
+	if (extra_bytes > slot->extra_buffer_capacity) {
+		if (slot->extra_buffer) free(slot->extra_buffer);
+		slot->extra_buffer = (char*) malloc(extra_bytes);
+		slot->extra_buffer_capacity = extra_bytes;
+	}
+	if (temp_recv_bytes > slot->temp_recv_buffer_capacity) {
+		if (slot->temp_recv_buffer) free(slot->temp_recv_buffer);
+		slot->temp_recv_buffer = (char*) malloc(temp_recv_bytes);
+		slot->temp_recv_buffer_capacity = temp_recv_bytes;
 	}
 }
 
@@ -122,9 +141,11 @@ int ParLinNa_servlet(
 	ServletSlot *slot { &servlet_ctx->slots[slot_idx] };
 	wait_slot_available(slot);
 
-	// ensure slot has enough buffer space
+	// ensure slot has enough buffer space for all workspace buffers
 	size_t required_send_bytes { static_cast<size_t>(max_send_count) * typesize * nprocs };
-	ensure_slot_capacity(slot, required_send_bytes, ngroup);
+	size_t required_extra_bytes { static_cast<size_t>(max_send_count) * typesize * nprocs };
+	size_t required_recv_bytes { static_cast<size_t>(max_send_count) * typesize * max_sd };
+	ensure_slot_capacity(slot, required_send_bytes, ngroup, required_extra_bytes, required_recv_bytes);
 	char *temp_send_buffer { slot->send_buffer };
 
 	st = MPI_Wtime();
@@ -142,8 +163,9 @@ int ParLinNa_servlet(
 	memset(pos_status, 0, nprocs * sizeof(int));
 	memcpy(updated_sentcounts, sendcounts, nprocs * sizeof(int));
 
-	char *extra_buffer { (char*) malloc(max_send_count * typesize * nprocs) };
-	char *temp_recv_buffer { (char*) malloc(max_send_count * typesize * max_sd) };
+	// workspace buffers owned by the slot — no malloc/free per call
+	char *extra_buffer { slot->extra_buffer };
+	char *temp_recv_buffer { slot->temp_recv_buffer };
 	et = MPI_Wtime();
 	alcCopy_time = et - st;
 
@@ -251,8 +273,7 @@ int ParLinNa_servlet(
 	et = MPI_Wtime();
 	orgData_time = et - st;
 
-	free(temp_recv_buffer);
-	free(extra_buffer);
+	// TODO: workspace buffers persist in the slot, NOT freed here
 
 
 	/*

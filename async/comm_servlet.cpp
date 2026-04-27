@@ -184,6 +184,10 @@ int servlet_init(ServletContext *ctx, const ServletConfig *config) {
         ctx->slots[i].send_buffer_capacity = 0;
         ctx->slots[i].sizes_storage = nullptr;
         ctx->slots[i].sizes_ngroup = 0;
+        ctx->slots[i].extra_buffer = nullptr;
+        ctx->slots[i].extra_buffer_capacity = 0;
+        ctx->slots[i].temp_recv_buffer = nullptr;
+        ctx->slots[i].temp_recv_buffer_capacity = 0;
         ctx->slots[i].post_time = 0;
         ctx->slots[i].progress_time = 0;
         ctx->slots[i].total_time = 0;
@@ -219,6 +223,14 @@ int servlet_shutdown(ServletContext *ctx) {
         if (ctx->slots[i].sizes_storage) {
             free(ctx->slots[i].sizes_storage);
             ctx->slots[i].sizes_storage = nullptr;
+        }
+        if (ctx->slots[i].extra_buffer) {
+            free(ctx->slots[i].extra_buffer);
+            ctx->slots[i].extra_buffer = nullptr;
+        }
+        if (ctx->slots[i].temp_recv_buffer) {
+            free(ctx->slots[i].temp_recv_buffer);
+            ctx->slots[i].temp_recv_buffer = nullptr;
         }
     }
 

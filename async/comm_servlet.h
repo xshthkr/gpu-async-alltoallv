@@ -99,6 +99,9 @@ one double-buffer slot
 owns the send buffer and sizes/displs arrays on the heap
 so they persist while the servlet reads them asynchronously
 
+also owns phase 1 workspace buffers (extra_buffer, temp_recv_buffer)
+so they are allocated once and reused across iterations
+
 sizes_storage layout: [send_sizes | send_displs | recv_sizes | recv_displs]
                        4 * ngroup ints total
 */
@@ -107,13 +110,20 @@ struct alignas(64) ServletSlot {
 
     CommDescriptor desc;
 
-    // owned send buffer (heap, persists across calls)
+    // owned send buffer for phase 2 (heap, persists across calls)
     char  *send_buffer{nullptr};
     size_t send_buffer_capacity{0};
 
     // owned sizes/displs storage (heap, 4 * ngroup ints)
     int   *sizes_storage{nullptr};
     int    sizes_ngroup{0};
+
+    // phase 1 workspace buffers (heap, reused across calls)
+    char  *extra_buffer{nullptr};
+    size_t extra_buffer_capacity{0};
+
+    char  *temp_recv_buffer{nullptr};
+    size_t temp_recv_buffer_capacity{0};
 
     // per-slot timing
     double post_time{0};
