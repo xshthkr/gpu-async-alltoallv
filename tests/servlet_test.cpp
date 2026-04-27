@@ -42,10 +42,10 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    int n = atoi(argv[1]);
-    int r = atoi(argv[2]);
-    int bblock = atoi(argv[3]);
-    int msg_size = atoi(argv[4]);
+    int n { atoi(argv[1]) };
+    int r { atoi(argv[2]) };
+    int bblock { atoi(argv[3]) };
+    int msg_size { atoi(argv[4]) };
 
     if (nprocs % n != 0) {
         if (rank == 0)
@@ -58,12 +58,13 @@ int main(int argc, char **argv) {
     int sendcounts[nprocs], recvcounts[nprocs];
     int sdispls[nprocs], rdispls[nprocs];
 
-    for (int i = 0; i < nprocs; i++) sendcounts[i] = msg_size;
+    for (int i { 0 }; i < nprocs; i++) { sendcounts[i] = msg_size; }
 
     MPI_Alltoall(sendcounts, 1, MPI_INT, recvcounts, 1, MPI_INT, MPI_COMM_WORLD);
 
-    int soffset = 0, roffset = 0;
-    for (int i = 0; i < nprocs; i++) {
+    int soffset { 0 };
+    int roffset { 0 };
+    for (int i { 0 }; i < nprocs; i++) {
         sdispls[i] = soffset;
         rdispls[i] = roffset;
         soffset += sendcounts[i];
@@ -72,19 +73,30 @@ int main(int argc, char **argv) {
 
     // fill send buffer with identifiable pattern: rank * 1000 + dest
     long long *sendbuf = new long long[soffset];
-    int idx = 0;
-    for (int i = 0; i < nprocs; i++) {
-        for (int j = 0; j < sendcounts[i]; j++) {
+    int idx { 0 };
+    for (int i { 0 }; i < nprocs; i++) {
+        for (int j { 0 }; j < sendcounts[i]; j++) {
             sendbuf[idx++] = rank * 1000 + i;
         }
     }
+
+    /* RUN MPI_Alltoallv */
+    long long *recv_mpi = new long long[roffset];
+    memset(recv_mpi, 0, roffset * sizeof(long long));
+
+    MPI_Barrier(MPI_COMM_WORLD);
+    double t0 { MPI_Wtime() };
+    MPI_Alltoallv(sendbuf, sendcounts, sdispls, MPI_LONG_LONG,
+                  recv_mpi, recvcounts, rdispls, MPI_LONG_LONG,
+                  MPI_COMM_WORLD);
+    double t_mpi { MPI_Wtime() - t0 };
 
     /* RUN ParLinNa_coalesced */
     long long *recv_ref = new long long[roffset];
     memset(recv_ref, 0, roffset * sizeof(long long));
 
     MPI_Barrier(MPI_COMM_WORLD);
-    double t0 = MPI_Wtime();
+    t0 = MPI_Wtime();
 
     async_rbruck_alltoallv::ParLinNa_coalesced(
         n, r, bblock,
@@ -92,7 +104,7 @@ int main(int argc, char **argv) {
         (char*)recv_ref, recvcounts, rdispls, MPI_LONG_LONG,
         MPI_COMM_WORLD);
 
-    double t_coalesced = MPI_Wtime() - t0;
+    double t_coalesced { MPI_Wtime() - t0 };
 
     /* RUN ParLinNa_servlet */
 
@@ -113,46 +125,62 @@ int main(int argc, char **argv) {
         (char*)recv_srv, recvcounts, rdispls, MPI_LONG_LONG,
         MPI_COMM_WORLD, &servlet_ctx);
 
-    double t_servlet = MPI_Wtime() - t0;
+    double t_servlet { MPI_Wtime() - t0 };
 
     async_rbruck_alltoallv::servlet_shutdown(&servlet_ctx);
 
     // compare results
-    int errors = 0;
-    for (int i = 0; i < roffset; i++) {
-        if (recv_ref[i] != recv_srv[i]) {
-            errors++;
-            if (errors <= 5) {
-                std::cerr << "[rank " << rank << "] mismatch at index " << i << ": ref=" << recv_ref[i] << " srv=" << recv_srv[i] << std::endl;
+    int errors_srv { 0 };
+    int errors_coal { 0 };
+    for (int i { 0 }; i < roffset; i++) {
+        if (recv_mpi[i] != recv_srv[i]) {
+            errors_srv++;
+            if (errors_srv <= 5) {
+                std::cerr << "[rank " << rank << "] servlet mismatch at index " << i << ": mpi=" << recv_mpi[i] << " srv=" << recv_srv[i] << std::endl;
+            }
+        }
+        if (recv_mpi[i] != recv_ref[i]) {
+            errors_coal++;
+            if (errors_coal <= 5) {
+                std::cerr << "[rank " << rank << "] coalesced mismatch at index " << i << ": mpi=" << recv_mpi[i] << " coal=" << recv_ref[i] << std::endl;
             }
         }
     }
 
     // gather results
-    int total_errors = 0;
-    MPI_Reduce(&errors, &total_errors, 1, MPI_INT, MPI_SUM, 0, MPI_COMM_WORLD);
+    int total_errors_srv { 0 };
+    int total_errors_coal { 0 };
+    MPI_Reduce(&errors_srv, &total_errors_srv, 1, MPI_INT, MPI_SUM, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&errors_coal, &total_errors_coal, 1, MPI_INT, MPI_SUM, 0, MPI_COMM_WORLD);
 
-    double max_t_coal = 0, max_t_srv = 0;
+    double max_t_mpi { 0 };
+    double max_t_coal { 0 };
+    double max_t_srv { 0 };
+    MPI_Reduce(&t_mpi, &max_t_mpi, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     MPI_Reduce(&t_coalesced, &max_t_coal, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     MPI_Reduce(&t_servlet, &max_t_srv, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     if (rank == 0) {
         std::cout << "Sasha's beloved ParLinNa Servlet Test" << std::endl;
         std::cout << "procs=" << nprocs << " n=" << n << " r=" << r << " bblock=" << bblock << " msg_size=" << msg_size << std::endl;
-        std::cout << "coalesced: " << max_t_coal << "s" << std::endl;
-        std::cout << "servlet:   " << max_t_srv << "s" << std::endl;
+        std::cout << "default mpi:  " << max_t_mpi << "s" << std::endl;
+        std::cout << "coalesced:    " << max_t_coal << "s" << std::endl;
+        std::cout << "servlet:      " << max_t_srv << "s" << std::endl;
 
-        if (total_errors == 0) {
-            std::cout << "PASS: results match (yipee)" << std::endl;
+        if (total_errors_srv == 0 && total_errors_coal == 0) {
+            std::cout << "PASS: all results match MPI_Alltoallv (yipee)" << std::endl;
         } else {
-            std::cout << "FAIL: " << total_errors << " mismatches (womp womp)" << std::endl;
+            if (total_errors_srv > 0) std::cout << "FAIL: servlet has " << total_errors_srv << " mismatches" << std::endl;
+            if (total_errors_coal > 0) std::cout << "FAIL: coalesced has " << total_errors_coal << " mismatches" << std::endl;
+            std::cout << "(womp womp)" << std::endl;
         }
     }
 
     delete[] sendbuf;
+    delete[] recv_mpi;
     delete[] recv_ref;
     delete[] recv_srv;
 
     MPI_Finalize();
-    return (total_errors > 0) ? 1 : 0;
+    return (total_errors_srv > 0 || total_errors_coal > 0) ? 1 : 0;
 }
