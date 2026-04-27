@@ -12,6 +12,15 @@
 
 namespace async_rbruck_alltoallv {
 
+/*
+Parameters:
+- adjustable radix r
+- tuneable block size b
+
+Substitutes fixed radix of bruck's algorithm with an adjustable radix
+to parameterize the number of communication steps and the block size
+to control the amount of data exchanged per step.
+*/
 int ParLogNa(
     int r, int b, 
     char *sendbuf, int *sendcounts, int *sdispls, MPI_Datatype sendtype,
@@ -119,7 +128,8 @@ int ParLogNa(
     int comm_size[r-1];
 	for (int x { 0 }; x < w; x++) {
 		ze = (x == w - 1)? r - d: r;
-		int zoffset = 0, zc = ze-1;
+		int zoffset = 0;
+		int zc { ze-1 };
 		int zns[zc];
 
 		for (int k { 1 }; k < ze; k += b) {

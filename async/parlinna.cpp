@@ -26,6 +26,18 @@ double SP_time          { 0 };
 
 namespace async_rbruck_alltoallv {
 
+/*
+Parameters:
+- number of processes per hierarchical group n (ranks per physical node)
+- radix of intra-group communication tree r
+- number of blocks to exchange per super-packet bblock
+
+Exploits hierarchy of HPC clusters where intra-node communication is
+much faster than inter-node communication. Processes within the same node
+use a localized version of ParLogNa. Data designated for other nodes are
+consolidated. Direct inter-node communication exchanges consolidated data
+with other nodes.
+*/
 int ParLinNa_coalesced(
     int n, int r, int bblock, 
     char *sendbuf, int *sendcounts, int *sdispls, MPI_Datatype sendtype, 
