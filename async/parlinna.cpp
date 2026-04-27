@@ -11,18 +11,18 @@
 #include <math.h>
 #include <memory.h>
 
-double init_time        { 0 };
-double findMax_time     { 0 };
-double rotateIndex_time { 0 };
-double alcCopy_time     { 0 };
-double getBlock_time    { 0 };
-double prepData_time    { 0 };
-double excgMeta_time    { 0 };
-double excgData_time    { 0 };
-double replace_time     { 0 };
-double orgData_time     { 0 };
-double prepSP_time      { 0 };
-double SP_time          { 0 };
+static double init_time        { 0 };
+static double findMax_time     { 0 };
+static double rotateIndex_time { 0 };
+static double alcCopy_time     { 0 };
+static double getBlock_time    { 0 };
+static double prepData_time    { 0 };
+static double excgMeta_time    { 0 };
+static double excgData_time    { 0 };
+static double replace_time     { 0 };
+static double orgData_time     { 0 };
+static double prepSP_time      { 0 };
+static double SP_time          { 0 };
 
 namespace async_rbruck_alltoallv {
 
