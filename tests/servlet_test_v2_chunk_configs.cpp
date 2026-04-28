@@ -175,7 +175,7 @@ int main(int argc, char **argv) {
                         total_errors += global_errors;
 
                         if (rank == 0) {
-                            std::cout << "[ServletV2Chunk] " << nprocs << ", " << msg_size << num_chunks << ", " << bsize << ", " << radix << ", " << max_elapsed << std::endl;
+                            std::cout << "[ServletV2Chunk] " << nprocs << ", " << msg_size << ", " << num_chunks << ", " << bsize << ", " << radix << ", " << max_elapsed << std::endl;
                             // std::cout << "[ServletV2Chunk] msg=" << msg_size
                             //           << " radix=" << radix
                             //           << " b=" << bsize
