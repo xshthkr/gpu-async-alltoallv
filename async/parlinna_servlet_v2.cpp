@@ -27,6 +27,19 @@
 
 namespace async_rbruck_alltoallv {
 
+static double init_time        { 0 };
+static double findMax_time     { 0 };
+static double rotateIndex_time { 0 };
+static double alcCopy_time     { 0 };
+static double getBlock_time    { 0 };
+static double prepData_time    { 0 };
+static double excgMeta_time    { 0 };
+static double excgData_time    { 0 };
+static double replace_time     { 0 };
+static double orgData_time     { 0 };
+static double prepSP_time      { 0 };
+static double SP_time          { 0 };
+
 extern void* servlet_malloc(size_t size, bool use_hugepages);
 extern void servlet_free(void *ptr);
 
@@ -87,6 +100,9 @@ static int run_phase1_chunk(
 	int imax { rbruck_alltoallv_utils::pow(r, sw-1) * ngroup };
 	int max_sd { (ngroup > imax) ? ngroup : imax };
 
+	double st { MPI_Wtime() }, et;
+
+	st = MPI_Wtime();
 	int local_max_count { 0 };
 	int max_send_count { 0 };
 	int id { 0 };
@@ -100,6 +116,8 @@ static int run_phase1_chunk(
 			local_max_count = chunk_sendcounts[i];
 	}
 	MPI_Allreduce(&local_max_count, &max_send_count, 1, MPI_INT, MPI_MAX, comm);
+	et = MPI_Wtime();
+	findMax_time += et - st;
 
 	size_t required_send { static_cast<size_t>(max_send_count) * typesize * nprocs };
 	size_t required_extra { static_cast<size_t>(max_send_count) * typesize * nprocs };
@@ -108,18 +126,24 @@ static int run_phase1_chunk(
 	
 	char *temp_send_buffer { slot->send_buffer };
 
+	st = MPI_Wtime();
 	for (int i { 0 }; i < ngroup; i++) {
 		int gsp { i * n };
 		for (int j { 0 }; j < n; j++) {
 			rotate_index_array[id++] = gsp + (2 * grank - j + n) % n;
 		}
 	}
+	et = MPI_Wtime();
+	rotateIndex_time += et - st;
 
+	st = MPI_Wtime();
 	memset(pos_status, 0, nprocs * sizeof(int));
 	memcpy(updated_sentcounts, chunk_sendcounts, nprocs * sizeof(int));
 
 	char *extra_buffer { slot->extra_buffer };
 	char *temp_recv_buffer { slot->temp_recv_buffer };
+	et = MPI_Wtime();
+	alcCopy_time += et - st;
 
 	// PHASE 1: intra-node bruck
 	int spoint { 1 }, distance { 1 }, next_distance { r }, di { 0 };
@@ -130,6 +154,7 @@ static int run_phase1_chunk(
 			spoint = z * distance;
 			if (spoint > n - 1) break;
 
+			st = MPI_Wtime();
 			for (int g { 0 }; g < ngroup; g++) {
 				for (int i { spoint }; i < n; i += next_distance) {
 					for (int j { i }; j < (i + distance); j++) {
@@ -139,7 +164,10 @@ static int run_phase1_chunk(
 					}
 				}
 			}
+			et = MPI_Wtime();
+			getBlock_time += et - st;
 
+			st = MPI_Wtime();
 			int metadata_send[di];
 			int sendCount { 0 }, offset { 0 };
 			for (int i { 0 }; i < di; i++) {
@@ -158,17 +186,26 @@ static int run_phase1_chunk(
 
 			int recv_proc { gid * n + (grank + spoint) % n };
 			int send_proc { gid * n + (grank - spoint + n) % n };
+			et = MPI_Wtime();
+			prepData_time += et - st;
 
+			st = MPI_Wtime();
 			int metadata_recv[di];
 			MPI_Sendrecv(metadata_send, di, MPI_INT, send_proc, 0,
 						 metadata_recv, di, MPI_INT, recv_proc, 0,
 						 comm, MPI_STATUS_IGNORE);
 			for (int i { 0 }; i < di; i++) sendCount += metadata_recv[i];
+			et = MPI_Wtime();
+			excgMeta_time += et - st;
 
+			st = MPI_Wtime();
 			MPI_Sendrecv(temp_send_buffer, offset, MPI_CHAR, send_proc, 1,
 						 temp_recv_buffer, sendCount * typesize, MPI_CHAR, recv_proc, 1,
 						 comm, MPI_STATUS_IGNORE);
+			et = MPI_Wtime();
+			excgData_time += et - st;
 
+			st = MPI_Wtime();
 			offset = 0;
 			for (int i { 0 }; i < di; i++) {
 				int send_index { rotate_index_array[sent_blocks[i]] };
@@ -178,11 +215,14 @@ static int run_phase1_chunk(
 				pos_status[send_index] = 1;
 				updated_sentcounts[send_index] = metadata_recv[i];
 			}
+			et = MPI_Wtime();
+			replace_time += et - st;
 		}
 		distance *= r;
 		next_distance *= r;
 	}
 
+	st = MPI_Wtime();
 	// organize data into temp_send_buffer for inter-node scatter
 	int index { 0 };
 	for (int i { 0 }; i < nprocs; i++) {
@@ -195,7 +235,10 @@ static int run_phase1_chunk(
 				   &extra_buffer[i * max_send_count * typesize], d);
 		index += d;
 	}
+	et = MPI_Wtime();
+	orgData_time += et - st;
 
+	st = MPI_Wtime();
 	// compute per-node sizes/displs into slot storage (contiguous layout, offset 0)
 	int *send_sizes  { &slot->sizes_storage[0] };
 	int *send_displs { &slot->sizes_storage[ngroup] };
@@ -217,7 +260,10 @@ static int run_phase1_chunk(
 		soff += send_sizes[i];
 		roff += recv_sizes[i];
 	}
+	et = MPI_Wtime();
+	prepSP_time += et - st;
 
+	st = MPI_Wtime();
 	// fill descriptor — recv into temp buffer (contiguous), NOT final recvbuf
 	CommDescriptor *desc { &slot->desc };
 	desc->send_buf    = temp_send_buffer;
@@ -232,6 +278,8 @@ static int run_phase1_chunk(
 	desc->grank       = grank;
 	desc->bblock      = bblock;
 	desc->comm        = comm;
+	et = MPI_Wtime();
+	SP_time += et - st;
 
 	return 0;
 }
@@ -243,6 +291,7 @@ int ParLinNa_servlet_v2(
 	char *recvbuf, int *recvcounts, int *rdispls, MPI_Datatype recvtype,
 	MPI_Comm comm, ServletContext *servlet_ctx)
 {
+	double st { MPI_Wtime() }, et;
 	if (r < 2) return -1;
 	if (num_chunks < 1) num_chunks = 1;
 
@@ -258,6 +307,9 @@ int ParLinNa_servlet_v2(
 	int sw { static_cast<int>(ceil(log(n) / float(log(r)))) };
 	int grank { rank % n };
 	int gid { rank / n };
+
+	et = MPI_Wtime();
+	init_time += et - st;
 
 	// single chunk: skip chunking overhead, write directly to recvbuf
 	if (num_chunks == 1) {
@@ -276,7 +328,10 @@ int ParLinNa_servlet_v2(
 		run_phase1_chunk(n, r, nprocs, typesize, ngroup, sw, grank, gid,
 						 sendbuf, sendcounts, sdispls, chunk_recvcounts,
 						 total_recv * typesize, comm, bblock, slot, servlet_ctx);
+		st = MPI_Wtime();
 		servlet_submit(servlet_ctx);
+		et = MPI_Wtime();
+		SP_time += et - st;
 		servlet_wait(servlet_ctx);
 
 		// scatter from contiguous temp buffer to recvbuf using rdispls
@@ -359,7 +414,10 @@ int ParLinNa_servlet_v2(
 						 chunk_recvcounts, chunk_total_recv * typesize,
 						 comm, bblock, slot, servlet_ctx);
 
+		st = MPI_Wtime();
 		servlet_submit(servlet_ctx);
+		et = MPI_Wtime();
+		SP_time += et - st;
 	}
 
 	// wait for all in-flight chunks to complete

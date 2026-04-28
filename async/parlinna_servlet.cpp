@@ -127,7 +127,7 @@ int ParLinNa_servlet(
 	int sent_blocks[max_sd];
 
 	double et { MPI_Wtime() };
-	init_time = et - st;
+	init_time += et - st;
 
 	st = MPI_Wtime();
 	// 1. Find max send elements per data-block
@@ -137,7 +137,7 @@ int ParLinNa_servlet(
 	}
 	MPI_Allreduce(&local_max_count, &max_send_count, 1, MPI_INT, MPI_MAX, comm);
 	et = MPI_Wtime();
-	findMax_time = et - st;
+	findMax_time += et - st;
 
 	// acquire current slot, wait if previous phase 2 still in-flight
 	int slot_idx { servlet_ctx->producer_idx };
@@ -160,7 +160,7 @@ int ParLinNa_servlet(
 		}
 	}
 	et = MPI_Wtime();
-	rotateIndex_time = et - st;
+	rotateIndex_time += et - st;
 
 	st = MPI_Wtime();
 	memset(pos_status, 0, nprocs * sizeof(int));
@@ -170,7 +170,7 @@ int ParLinNa_servlet(
 	char *extra_buffer { slot->extra_buffer };
 	char *temp_recv_buffer { slot->temp_recv_buffer };
 	et = MPI_Wtime();
-	alcCopy_time = et - st;
+	alcCopy_time += et - st;
 
 	/*
 	PHASE 1: intra-node bruck (identical to ParLinNa_coalesced)
@@ -274,7 +274,7 @@ int ParLinNa_servlet(
 		index += d;
 	}
 	et = MPI_Wtime();
-	orgData_time = et - st;
+	orgData_time += et - st;
 
 	// TODO: workspace buffers persist in the slot, NOT freed here
 
@@ -315,7 +315,7 @@ int ParLinNa_servlet(
 	}
 
 	et = MPI_Wtime();
-	prepSP_time = et - st;
+	prepSP_time += et - st;
 
 	st = MPI_Wtime();
 
@@ -340,7 +340,7 @@ int ParLinNa_servlet(
 	servlet_submit(servlet_ctx);
 
 	et = MPI_Wtime();
-	SP_time = et - st;
+	SP_time += et - st;
 
 	// NOTE: temp_send_buffer is NOT freed here
 	// it lives in the slot and persists until reuse or shutdown
