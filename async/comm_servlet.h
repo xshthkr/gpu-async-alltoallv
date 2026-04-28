@@ -88,7 +88,7 @@ returns ServletConfig with sensible defaults
 */
 inline ServletConfig servlet_default_config() {
     ServletConfig c;
-    c.servlet_core_id    = -2; // auto detect NIC affinity via hwloc by default
+    c.servlet_core_id    = -2; // auto detect NIC affinity via sched_getaffinity (hwloc to force pin) by default
     c.backoff_max_us     = 100;
     c.deadlock_timeout_s = 10;
     c.use_hugepages      = true;

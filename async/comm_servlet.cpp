@@ -13,13 +13,47 @@
 #include <sched.h>
 #include <time.h>
 #include <sys/mman.h>
-// #include <hwloc.h>
+#include <hwloc.h>
 
 namespace async_rbruck_alltoallv {
 
 /*
 INTERNAL APIS
 */
+
+static hwloc_bitmap_t get_nic_cpuset() {
+    hwloc_topology_t topology;
+    if (hwloc_topology_init(&topology) < 0) return nullptr;
+    
+    hwloc_topology_set_io_types_filter(topology, HWLOC_TYPE_FILTER_KEEP_ALL);
+    if (hwloc_topology_load(topology) < 0) {
+        hwloc_topology_destroy(topology);
+        return nullptr;
+    }
+
+    hwloc_bitmap_t nic_cpuset = hwloc_bitmap_alloc();
+    hwloc_obj_t osdev = nullptr;
+    bool found = false;
+    
+    // find first Network (Ethernet) device
+    while ((osdev = hwloc_get_next_osdev(topology, osdev)) != nullptr) {
+        if (osdev->attr->osdev.type == HWLOC_OBJ_OSDEV_NETWORK) {
+            hwloc_obj_t non_io = hwloc_get_non_io_ancestor_obj(topology, osdev);
+            if (non_io && non_io->cpuset) {
+                hwloc_bitmap_copy(nic_cpuset, non_io->cpuset);
+                found = true;
+                break;
+            }
+        }
+    }
+
+    hwloc_topology_destroy(topology);
+    if (!found) {
+        hwloc_bitmap_free(nic_cpuset);
+        return nullptr;
+    }
+    return nic_cpuset;
+}
 
 void* servlet_malloc(size_t size, bool use_hugepages) {
     void *ptr = nullptr;
@@ -270,7 +304,7 @@ PUBLIC APIS
 //     ctx->thread_active = true;
 //     return 0;
 // }
-    
+
 int servlet_init(ServletContext *ctx, const ServletConfig *config) {
 
     ctx->config = *config;
@@ -294,16 +328,39 @@ int servlet_init(ServletContext *ctx, const ServletConfig *config) {
         }
 
         if (first_cpu != -1 && second_cpu != -1) {
-            // pin main compute thread to first CPU
+            int main_core = first_cpu;
+            int servlet_core = second_cpu;
+
+            hwloc_bitmap_t nic_cpuset = get_nic_cpuset();
+            if (nic_cpuset) {
+                bool first_in_nic = hwloc_bitmap_isset(nic_cpuset, first_cpu);
+                bool second_in_nic = hwloc_bitmap_isset(nic_cpuset, second_cpu);
+
+                if (first_in_nic && !second_in_nic) {
+                    // Swap so servlet_core gets the NIC-affine one
+                    main_core = second_cpu;
+                    servlet_core = first_cpu;
+                }
+                hwloc_bitmap_free(nic_cpuset);
+            }
+
+            // pin main compute thread to main_core
+            cpu_set_t main_set;
+            CPU_ZERO(&main_set);
+            CPU_SET(main_core, &main_set);
+            pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &main_set);
+
+            // tell servlet to pin background thread to servlet_core
+            ctx->config.servlet_core_id = servlet_core;
+        } else if (first_cpu != -1) {
+            // only one core available, pin main to it and don't pin servlet
             cpu_set_t main_set;
             CPU_ZERO(&main_set);
             CPU_SET(first_cpu, &main_set);
             pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &main_set);
-
-            // tell servlet to pin background thread to second CPU
-            ctx->config.servlet_core_id = second_cpu;
+            ctx->config.servlet_core_id = -1;
         } else {
-            // fallback if we didn't get at least 2 CPUs
+            // fallback if we didn't get any CPUs
             ctx->config.servlet_core_id = -1;
         }
     }
