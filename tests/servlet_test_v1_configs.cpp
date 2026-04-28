@@ -4,12 +4,14 @@
  * Run ParLinNa_servlet v1 across a sweep of message sizes, radix values,
  * and block sizes. The test builds a random send-count distribution for each
  * message size, compares to MPI_Alltoallv, and repeats for the requested
- * number of iterations and across multiple configuration combinations
+ * number of iterations
  *
  * usage: mpirun -n <nprocs> ./servlet_test_v1_configs <loop-count> <n> <bblock> <radix-list...>
  *
  *      Author: xshthkr
  */
+
+// TODO: benchmark across multiple servlet configuration combinations
 
 #include "../async/async.h"
 #include "../async/comm_servlet.h"
@@ -44,11 +46,11 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    int loopcount = std::atoi(argv[1]);
-    int n = std::atoi(argv[2]);
-    int bblock = std::atoi(argv[3]);
+    int loopcount { std::atoi(argv[1]) };
+    int n { std::atoi(argv[2]) };
+    int bblock { std::atoi(argv[3]) };
     std::vector<int> radix_list;
-    for (int arg = 4; arg < argc; ++arg) {
+    for (int arg { 4 }; arg < argc; ++arg) {
         radix_list.push_back(std::atoi(argv[arg]));
     }
 
@@ -68,26 +70,26 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    int ngroup = nprocs / n;
+    int ngroup { nprocs / n };
     std::mt19937_64 rng(static_cast<unsigned long long>(std::chrono::high_resolution_clock::now().time_since_epoch().count()) + rank);
 
-    for (int msg_size = 2; msg_size <= 1024; msg_size *= 2) {
+    for (int msg_size { 2 }; msg_size <= 1024; msg_size *= 2) {
         int sendcounts[nprocs];
         int sdispls[nprocs];
         int recvcounts[nprocs];
         int rdispls[nprocs];
 
         std::uniform_int_distribution<int> dist(1, msg_size);
-        for (int i = 0; i < nprocs; ++i) {
+        for (int i { 0 }; i < nprocs; ++i) {
             sendcounts[i] = dist(rng);
         }
         std::shuffle(sendcounts, sendcounts + nprocs, rng);
 
         MPI_Alltoall(sendcounts, 1, MPI_INT, recvcounts, 1, MPI_INT, MPI_COMM_WORLD);
 
-        int soffset = 0;
-        int roffset = 0;
-        for (int i = 0; i < nprocs; ++i) {
+        int soffset { 0 };
+        int roffset { 0 };
+        for (int i { 0 }; i < nprocs; ++i) {
             sdispls[i] = soffset;
             rdispls[i] = roffset;
             soffset += sendcounts[i];
@@ -97,28 +99,28 @@ int main(int argc, char **argv) {
         long long *sendbuf = new long long[soffset];
         long long *recv_mpi = new long long[roffset];
 
-        int idx = 0;
-        for (int i = 0; i < nprocs; ++i) {
-            for (int j = 0; j < sendcounts[i]; ++j) {
+        int idx { 0 };
+        for (int i { 0 }; i < nprocs; ++i) {
+            for (int j { 0 }; j < sendcounts[i]; ++j) {
                 sendbuf[idx++] = static_cast<long long>(rank) * 1000000LL + static_cast<long long>(i) * 1000LL + j;
             }
         }
         std::memset(recv_mpi, 0, roffset * sizeof(long long));
 
         MPI_Barrier(MPI_COMM_WORLD);
-        double t0 = MPI_Wtime();
+        double t0 { MPI_Wtime() };
         MPI_Alltoallv(sendbuf, sendcounts, sdispls, MPI_LONG_LONG,
                       recv_mpi, recvcounts, rdispls, MPI_LONG_LONG,
                       MPI_COMM_WORLD);
-        double t_mpi = MPI_Wtime() - t0;
+        double t_mpi { MPI_Wtime() - t0 };
 
         if (rank == 0) {
             std::cout << "\n[msg_size=" << msg_size << "] MPI_Alltoallv baseline: " << t_mpi << "s" << std::endl;
         }
 
         for (int r_value : radix_list) {
-            int radix = r_value;
-            for (int bsize = 1; bsize <= ngroup; bsize *= 2) {
+            int radix { r_value };
+            for (int bsize { 1 }; bsize <= ngroup; bsize *= 2) {
                 async_rbruck_alltoallv::ServletConfig cfg { async_rbruck_alltoallv::servlet_default_config() };
                 async_rbruck_alltoallv::ServletContext servlet_ctx;
                 if (async_rbruck_alltoallv::servlet_init(&servlet_ctx, &cfg) != 0) {
@@ -128,10 +130,10 @@ int main(int argc, char **argv) {
                     MPI_Abort(MPI_COMM_WORLD, 1);
                 }
 
-                int total_errors = 0;
-                double max_time_for_config = 0.0;
+                int total_errors { 0 };
+                double max_time_for_config { 0.0 };
 
-                for (int it = 0; it < loopcount; ++it) {
+                for (int it { 0 }; it < loopcount; ++it) {
                     long long *recv_srv = new long long[roffset];
                     std::memset(recv_srv, 0, roffset * sizeof(long long));
 
@@ -143,28 +145,29 @@ int main(int argc, char **argv) {
                         reinterpret_cast<char*>(recv_srv), recvcounts, rdispls, MPI_LONG_LONG,
                         MPI_COMM_WORLD, &servlet_ctx);
                     async_rbruck_alltoallv::servlet_wait(&servlet_ctx);
-                    double elapsed = MPI_Wtime() - t0;
+                    double elapsed { MPI_Wtime() - t0 };
 
-                    double max_elapsed = 0.0;
+                    double max_elapsed { 0.0 };
                     MPI_Allreduce(&elapsed, &max_elapsed, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
                     if (max_elapsed > max_time_for_config) {
                         max_time_for_config = max_elapsed;
                     }
 
-                    int local_errors = 0;
-                    for (int i = 0; i < roffset; ++i) {
+                    int local_errors { 0 };
+                    for (int i { 0 }; i < roffset; ++i) {
                         if (recv_srv[i] != recv_mpi[i]) {
                             local_errors += 1;
                         }
                     }
-                    int global_errors = 0;
+                    int global_errors { 0 };
                     MPI_Allreduce(&local_errors, &global_errors, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
                     total_errors += global_errors;
 
                     if (rank == 0) {
-                        std::cout << "[msg=" << msg_size << ", radix=" << radix << ", b=" << bsize
-                                  << ", iter=" << it << "] max_time=" << max_elapsed
-                                  << "s errors=" << global_errors << std::endl;
+                        std::cout << "[ServletV1Base] " << nprocs << ", " << n << ", " << bsize << ", " << radix << ", " << max_elapsed << std::endl; 
+                        // std::cout << "[msg=" << msg_size << ", radix=" << radix << ", b=" << bsize
+                        //           << ", iter=" << it << "] max_time=" << max_elapsed
+                        //           << "s errors=" << global_errors << std::endl;
                     }
 
                     delete[] recv_srv;
@@ -173,11 +176,9 @@ int main(int argc, char **argv) {
                 async_rbruck_alltoallv::servlet_shutdown(&servlet_ctx);
 
                 if (rank == 0) {
-                    std::cout << "[msg=" << msg_size << ", radix=" << radix << ", b=" << bsize << "] "
-                              << "best_max_time=" << max_time_for_config << "s";
-                    if (total_errors == 0) {
-                        std::cout << " PASS";
-                    } else {
+                    // std::cout << "[msg=" << msg_size << ", radix=" << radix << ", b=" << bsize << "] "
+                    //           << "best_max_time=" << max_time_for_config << "s";
+                    if (total_errors != 0) {
                         std::cout << " FAIL(total_errors=" << total_errors << ")";
                     }
                     std::cout << std::endl;
