@@ -38,3 +38,12 @@ target_link_libraries(servlet_test_v1_slot_configs
     MPI::MPI_CXX
     Threads::Threads
 )
+
+add_executable(servlet_test_v2_chunk_configs ./servlet_test_v2_chunk_configs.cpp)
+
+target_link_libraries(servlet_test_v2_chunk_configs
+    PUBLIC
+    async-overlap
+    MPI::MPI_CXX
+    Threads::Threads
+)
