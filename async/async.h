@@ -37,6 +37,12 @@ int ParLinNa_servlet(
     char *recvbuf, int *recvcounts, int *rdispls, MPI_Datatype recvtype, 
     MPI_Comm comm, ServletContext *servlet_ctx);
 
+int ParLinNa_servlet_v2(
+    int n, int r, int bblock, int num_chunks,
+    char *sendbuf, int *sendcounts, int *sdispls, MPI_Datatype sendtype,
+    char *recvbuf, int *recvcounts, int *rdispls, MPI_Datatype recvtype,
+    MPI_Comm comm, ServletContext *servlet_ctx);
+
 }
 
 #endif /* ASYNC_H_ */

@@ -3,8 +3,12 @@
  *
  * ParLinNa_coalesced with comm servlet for phase 2
  *
- * phase 1 (intra-node bruck) is identical to ParLinNa_coalesced
- * phase 2 (inter-node scatter) is offloaded to the comm servlet
+ * phase 1 (intra-node bruck) runs on main thread
+ * phase 2 (inter-node scatter) is offloaded to comm servlet
+ *
+ * double-buffered slots enable pipelining:
+ * calling ParLinNa_servlet repeatedly overlaps phase 2 of the
+ * current call with phase 1 of the next call automatically
  *
  *      Author: xshthkr
  */
@@ -34,6 +38,61 @@ static double SP_time          { 0 };
 
 namespace async_rbruck_alltoallv {
 
+extern void* servlet_malloc(size_t size, bool use_hugepages);
+extern void servlet_free(void *ptr);
+
+/*
+wait until a slot is available for new work
+transitions DONE -> IDLE, spins on READY
+*/
+static void wait_slot_available(ServletSlot *slot) {
+	while (true) {
+		int s { slot->state.load(std::memory_order_acquire) };
+		if (s == static_cast<int>(ServletState::IDLE)) return;
+		if (s == static_cast<int>(ServletState::DONE)) {
+			slot->state.store(static_cast<int>(ServletState::IDLE), std::memory_order_release);
+			return;
+		}
+		/* READY: still in-flight, spin */
+	}
+}
+
+/*
+ensure the slot has enough capacity for all heap-owned buffers:
+- send_buffer: phase 2 send payload
+- sizes_storage: per-node send/recv sizes and displacements
+- extra_buffer: phase 1 bruck intermediate storage
+- temp_recv_buffer: phase 1 bruck receive scratch
+
+only reallocates when current capacity is insufficient
+in steady-state loops (same n, nprocs, msg_size), zero allocations
+*/
+static void ensure_slot_capacity(
+	ServletSlot *slot, size_t send_bytes, int ngroup,
+	size_t extra_bytes, size_t temp_recv_bytes, bool use_hugepages)
+{
+	if (send_bytes > slot->send_buffer_capacity) {
+		if (slot->send_buffer) servlet_free(slot->send_buffer);
+		slot->send_buffer = (char*) servlet_malloc(send_bytes, use_hugepages);
+		slot->send_buffer_capacity = send_bytes;
+	}
+	if (ngroup > slot->sizes_ngroup) {
+		if (slot->sizes_storage) free(slot->sizes_storage); // sizes array is small, standard malloc
+		slot->sizes_storage = (int*) malloc(4 * ngroup * sizeof(int));
+		slot->sizes_ngroup = ngroup;
+	}
+	if (extra_bytes > slot->extra_buffer_capacity) {
+		if (slot->extra_buffer) servlet_free(slot->extra_buffer);
+		slot->extra_buffer = (char*) servlet_malloc(extra_bytes, use_hugepages);
+		slot->extra_buffer_capacity = extra_bytes;
+	}
+	if (temp_recv_bytes > slot->temp_recv_buffer_capacity) {
+		if (slot->temp_recv_buffer) servlet_free(slot->temp_recv_buffer);
+		slot->temp_recv_buffer = (char*) servlet_malloc(temp_recv_bytes, use_hugepages);
+		slot->temp_recv_buffer_capacity = temp_recv_bytes;
+	}
+}
+
 int ParLinNa_servlet(
     int n, int r, int bblock,
     char *sendbuf, int *sendcounts, int *sdispls, MPI_Datatype sendtype,
@@ -52,42 +111,45 @@ int ParLinNa_servlet(
 	int typesize;
 	MPI_Type_size(sendtype, &typesize);
 
-	int ngroup, sw;
-	int grank, gid, imax, max_sd;
+	int ngroup { nprocs / n };
+	int sw { static_cast<int>(ceil(log(n) / float(log(r)))) };
+	int grank { rank % n };
+	int gid { rank / n };
+	int imax { rbruck_alltoallv_utils::pow(r, sw-1) * ngroup };
+	int max_sd { (ngroup > imax) ? ngroup : imax };
+
 	int local_max_count { 0 };
     int max_send_count { 0 };
     int id { 0 };
 	int updated_sentcounts[nprocs];
     int rotate_index_array[nprocs];
     int pos_status[nprocs];
-	char *temp_send_buffer;
-    char *extra_buffer;
-    char *temp_recv_buffer;
-
-
-	ngroup = nprocs / float(n); // number of groups
-    if (r > n) { r = n; }
-
-	sw = ceil(log(n) / float(log(r))); // required digits for intra-Bruck
-
-	grank = rank % n; // rank of each process in a group
-	gid = rank / n; // group id
-	imax = rbruck_alltoallv_utils::pow(r, sw-1) * ngroup;
-	max_sd = (ngroup > imax)? ngroup: imax; // max send data block count
-
 	int sent_blocks[max_sd];
+
 	double et { MPI_Wtime() };
 	init_time = et - st;
 
 	st = MPI_Wtime();
 	// 1. Find max send elements per data-block
-	for (int i = 0; i < nprocs; i++) {
+	for (int i { 0 }; i < nprocs; i++) {
 		if (sendcounts[i] > local_max_count)
 			local_max_count = sendcounts[i];
 	}
 	MPI_Allreduce(&local_max_count, &max_send_count, 1, MPI_INT, MPI_MAX, comm);
 	et = MPI_Wtime();
 	findMax_time = et - st;
+
+	// acquire current slot, wait if previous phase 2 still in-flight
+	int slot_idx { servlet_ctx->producer_idx };
+	ServletSlot *slot { &servlet_ctx->slots[slot_idx] };
+	wait_slot_available(slot);
+
+	// ensure slot has enough buffer space for all workspace buffers
+	size_t required_send_bytes { static_cast<size_t>(max_send_count) * typesize * nprocs };
+	size_t required_extra_bytes { static_cast<size_t>(max_send_count) * typesize * nprocs };
+	size_t required_recv_bytes { static_cast<size_t>(max_send_count) * typesize * max_sd };
+	ensure_slot_capacity(slot, required_send_bytes, ngroup, required_extra_bytes, required_recv_bytes, servlet_ctx->config.use_hugepages);
+	char *temp_send_buffer { slot->send_buffer };
 
 	st = MPI_Wtime();
 	// 2. create local index array after rotation
@@ -103,9 +165,10 @@ int ParLinNa_servlet(
 	st = MPI_Wtime();
 	memset(pos_status, 0, nprocs * sizeof(int));
 	memcpy(updated_sentcounts, sendcounts, nprocs * sizeof(int));
-	temp_send_buffer = (char*) malloc(max_send_count * typesize * nprocs);
-	extra_buffer = (char*) malloc(max_send_count * typesize * nprocs);
-	temp_recv_buffer = (char*) malloc(max_send_count * typesize * max_sd);
+
+	// workspace buffers owned by the slot — no malloc/free per call
+	char *extra_buffer { slot->extra_buffer };
+	char *temp_recv_buffer { slot->temp_recv_buffer };
 	et = MPI_Wtime();
 	alcCopy_time = et - st;
 
@@ -199,7 +262,7 @@ int ParLinNa_servlet(
 
 	st = MPI_Wtime();
 	// organize data into temp_send_buffer for inter-node scatter
-	int index = 0;
+	int index { 0 };
 	for (int i { 0 }; i < nprocs; i++) {
 		int d { updated_sentcounts[rotate_index_array[i]] * typesize };
 		if (grank == (i % n) ) {
@@ -213,32 +276,42 @@ int ParLinNa_servlet(
 	et = MPI_Wtime();
 	orgData_time = et - st;
 
-	free(temp_recv_buffer);
-	free(extra_buffer);
+	// TODO: workspace buffers persist in the slot, NOT freed here
 
 
 	/*
 	PHASE 2: inter-node scatter via comm servlet
 
 	compute per-node send/recv sizes and displacements (in bytes),
-	fill the servlet's CommDescriptor, submit, and wait
+	fill the slot's CommDescriptor, submit, and return immediately
+	the servlet thread executes the transfers asynchronously
 	*/
 
 	st = MPI_Wtime();
 
-	int nsend[ngroup], nrecv[ngroup], nsdisp[ngroup], nrdisp[ngroup];
-	int soffset = 0, roffset = 0;
+	// point desc sizes/displs at the slot's heap-allocated storage
+	// layout: [send_sizes | send_displs | recv_sizes | recv_displs]
+	int *send_sizes  { &slot->sizes_storage[0] };
+	int *send_displs { &slot->sizes_storage[ngroup] };
+	int *recv_sizes  { &slot->sizes_storage[2 * ngroup] };
+	int *recv_displs { &slot->sizes_storage[3 * ngroup] };
+
+	int soffset { 0 }, roffset { 0 };
 	for (int i { 0 }; i < ngroup; i++) {
-		nsend[i] = 0;
-        nrecv[i] = 0;
+		int nsend_elems { 0 };
+		int nrecv_elems { 0 };
 		for (int j { 0 }; j < n; j++) {
 			int id { i * n + j };
 			int sn { updated_sentcounts[rotate_index_array[id]] };
-			nsend[i] += sn;
-			nrecv[i] += recvcounts[id];
+			nsend_elems += sn;
+			nrecv_elems += recvcounts[id];
 		}
-		nsdisp[i] = soffset, nrdisp[i] = roffset;
-		soffset += nsend[i] * typesize, roffset += nrecv[i] * typesize;
+		send_sizes[i]  = nsend_elems * typesize;
+		send_displs[i] = soffset;
+		recv_sizes[i]  = nrecv_elems * typesize;
+		recv_displs[i] = roffset;
+		soffset += send_sizes[i];
+		roffset += recv_sizes[i];
 	}
 
 	et = MPI_Wtime();
@@ -246,27 +319,14 @@ int ParLinNa_servlet(
 
 	st = MPI_Wtime();
 
-	// convert element counts to byte counts for the descriptor
-	int nsend_bytes[ngroup], nrecv_bytes[ngroup];
-	for (int i { 0 }; i < ngroup; i++) {
-		nsend_bytes[i] = nsend[i] * typesize;
-		nrecv_bytes[i] = nrecv[i] * typesize;
-	}
-
-	// DONT FORGET THIS SHIT
-	// HELLA IMPORTANT
-	// TODO: nsend_bytes, nsdisp, nrecv_bytes, nrdisp are stack-allocated
-	// safe now because servlet_wait() blocks before this frame returns
-	// if real overlap is added later, heap-allocate these or copy into desc
-	
-	// fill descriptor and submit to servlet
-	CommDescriptor *desc = &servlet_ctx->desc;
+	// fill descriptor
+	CommDescriptor *desc { &slot->desc };
 	desc->send_buf   	= temp_send_buffer;
-	desc->send_sizes 	= nsend_bytes;
-	desc->send_displs	= nsdisp;
+	desc->send_sizes 	= send_sizes;
+	desc->send_displs	= send_displs;
 	desc->recv_buf   	= recvbuf;
-	desc->recv_sizes 	= nrecv_bytes;
-	desc->recv_displs	= nrdisp;
+	desc->recv_sizes 	= recv_sizes;
+	desc->recv_displs	= recv_displs;
 	desc->ngroup     	= ngroup;
 	desc->n          	= n;
 	desc->gid        	= gid;
@@ -274,18 +334,16 @@ int ParLinNa_servlet(
 	desc->bblock     	= bblock;
 	desc->comm       	= comm;
 
+	// submit to servlet and return immediately
+	// the next call to ParLinNa_servlet will wait for this slot
+	// when it wraps around (after NUM_SLOTS calls)
 	servlet_submit(servlet_ctx);
-
-	// OVERLAP WINDOW
-	// compute ranks are free to do useful work here
-	// for now spin-wait
-
-	servlet_wait(servlet_ctx);
 
 	et = MPI_Wtime();
 	SP_time = et - st;
 
-	free(temp_send_buffer);
+	// NOTE: temp_send_buffer is NOT freed here
+	// it lives in the slot and persists until reuse or shutdown
 
 	return 0;
 }

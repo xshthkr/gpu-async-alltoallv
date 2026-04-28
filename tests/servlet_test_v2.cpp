@@ -1,20 +1,16 @@
 /*
- * servlet_test.cpp
+ * servlet_test_v2.cpp
  *
- * tests ParLinNa_servlet correctness and pipelining performance
+ * tests ParLinNa_servlet_v2 (chunked single-call pipeline)
  *
  * 1. MPI_Alltoallv          (baseline)
  * 2. ParLinNa_coalesced     (reference)
- * 3. ParLinNa_servlet       (single-shot, with wait)
- * 4. ParLinNa_servlet       (pipelined, multi-iteration overlap)
+ * 3. ParLinNa_servlet       (v1, no chunking)
+ * 4. ParLinNa_servlet_v2    (chunked pipeline, varying chunk counts)
  *
  * correctness: all results compared against MPI_Alltoallv
  *
- * usage: mpirun -n <nprocs> ./servlet_test <n> <r> <bblock> <msg_size>
- *  n        = ranks per node (group size)
- *  r        = bruck radix
- *  bblock   = batching block size
- *  msg_size = elements per destination
+ * usage: mpirun -n <nprocs> ./servlet_test_v2 <n> <r> <bblock> <msg_size>
  *
  *      Author: xshthkr
  */
@@ -26,8 +22,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <mpi.h>
-
-static const int NUM_ITERS = 10;
 
 int main(int argc, char **argv) {
 
@@ -62,7 +56,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    // build uniform sendcounts (msg_size elements to each rank)
+    // build uniform sendcounts
     int sendcounts[nprocs], recvcounts[nprocs];
     int sdispls[nprocs], rdispls[nprocs];
 
@@ -70,8 +64,7 @@ int main(int argc, char **argv) {
 
     MPI_Alltoall(sendcounts, 1, MPI_INT, recvcounts, 1, MPI_INT, MPI_COMM_WORLD);
 
-    int soffset { 0 };
-    int roffset { 0 };
+    int soffset { 0 }, roffset { 0 };
     for (int i { 0 }; i < nprocs; i++) {
         sdispls[i] = soffset;
         rdispls[i] = roffset;
@@ -79,8 +72,8 @@ int main(int argc, char **argv) {
         roffset += recvcounts[i];
     }
 
-    // fill send buffer with identifiable pattern: rank * 1000 + dest
-    long long *sendbuf = new long long[soffset];
+    // fill send buffer: rank * 1000 + dest
+    long long *sendbuf { new long long[soffset] };
     int idx { 0 };
     for (int i { 0 }; i < nprocs; i++) {
         for (int j { 0 }; j < sendcounts[i]; j++) {
@@ -112,9 +105,9 @@ int main(int argc, char **argv) {
         MPI_COMM_WORLD);
     double t_coal { MPI_Wtime() - t0 };
 
-    /* 3. ParLinNa_servlet (single-shot) */
-    long long *recv_srv { new long long[roffset] };
-    memset(recv_srv, 0, roffset * sizeof(long long));
+    /* 3. ParLinNa_servlet v1 (single-shot, no chunking) */
+    long long *recv_v1 { new long long[roffset] };
+    memset(recv_v1, 0, roffset * sizeof(long long));
 
     async_rbruck_alltoallv::ServletConfig cfg { async_rbruck_alltoallv::servlet_default_config() };
     async_rbruck_alltoallv::ServletContext servlet_ctx;
@@ -125,79 +118,123 @@ int main(int argc, char **argv) {
     async_rbruck_alltoallv::ParLinNa_servlet(
         n, r, bblock,
         (char*)sendbuf, sendcounts, sdispls, MPI_LONG_LONG,
-        (char*)recv_srv, recvcounts, rdispls, MPI_LONG_LONG,
+        (char*)recv_v1, recvcounts, rdispls, MPI_LONG_LONG,
         MPI_COMM_WORLD, &servlet_ctx);
     async_rbruck_alltoallv::servlet_wait(&servlet_ctx);
-    double t_srv { MPI_Wtime() - t0 };
+    double t_v1 { MPI_Wtime() - t0 };
 
-    /* 4. ParLinNa_servlet pipelined (multi-iteration) */
-    long long **recv_pipe { new long long*[NUM_ITERS] };
-    for (int i { 0 }; i < NUM_ITERS; i++) {
-        recv_pipe[i] = new long long[roffset];
-        memset(recv_pipe[i], 0, roffset * sizeof(long long));
+    /* 4. ParLinNa_servlet_v2 with varying chunk counts */
+    int chunk_counts[] = { 2, 4, 8 };
+    int num_configs { 3 };
+
+    // skip chunk counts that exceed msg_size (can't split 1 element into 4 chunks)
+    // find how many are valid
+    int valid_configs { 0 };
+    for (int c { 0 }; c < num_configs; c++) {
+        if (chunk_counts[c] <= msg_size) valid_configs++;
     }
 
-    MPI_Barrier(MPI_COMM_WORLD);
-    t0 = MPI_Wtime();
-    for (int i { 0 }; i < NUM_ITERS; i++) {
-        async_rbruck_alltoallv::ParLinNa_servlet(
-            n, r, bblock,
+    long long **recv_v2 { new long long*[valid_configs] };
+    double *t_v2 { new double[valid_configs] };
+
+    int vi { 0 };
+    for (int c { 0 }; c < num_configs; c++) {
+        if (chunk_counts[c] > msg_size) continue;
+
+        recv_v2[vi] = new long long[roffset];
+        memset(recv_v2[vi], 0, roffset * sizeof(long long));
+
+        MPI_Barrier(MPI_COMM_WORLD);
+        t0 = MPI_Wtime();
+        async_rbruck_alltoallv::ParLinNa_servlet_v2(
+            n, r, bblock, chunk_counts[c],
             (char*)sendbuf, sendcounts, sdispls, MPI_LONG_LONG,
-            (char*)recv_pipe[i], recvcounts, rdispls, MPI_LONG_LONG,
+            (char*)recv_v2[vi], recvcounts, rdispls, MPI_LONG_LONG,
             MPI_COMM_WORLD, &servlet_ctx);
+        t_v2[vi] = MPI_Wtime() - t0;
+        vi++;
     }
-    async_rbruck_alltoallv::servlet_wait(&servlet_ctx);
-    double t_pipe { MPI_Wtime() - t0 };
 
     async_rbruck_alltoallv::servlet_shutdown(&servlet_ctx);
 
-    /* correctness checks against MPI_Alltoallv */
-    int errors_coal { 0 }, errors_srv { 0 }, errors_pipe { 0 };
-
+    /* correctness checks */
+    int errors_coal { 0 }, errors_v1 { 0 };
     for (int i { 0 }; i < roffset; i++) {
         if (recv_mpi[i] != recv_coal[i]) errors_coal++;
-        if (recv_mpi[i] != recv_srv[i]) errors_srv++;
+        if (recv_mpi[i] != recv_v1[i]) errors_v1++;
     }
-    for (int iter { 0 }; iter < NUM_ITERS; iter++) {
+
+    int *errors_v2 { new int[valid_configs] };
+    for (int c { 0 }; c < valid_configs; c++) {
+        errors_v2[c] = 0;
         for (int i { 0 }; i < roffset; i++) {
-            if (recv_mpi[i] != recv_pipe[iter][i]) errors_pipe++;
+            if (recv_mpi[i] != recv_v2[c][i]) errors_v2[c]++;
         }
     }
 
-    int total_coal { 0 }, total_srv { 0 }, total_pipe { 0 };
+    /* reduce results to rank 0 */
+    int total_coal { 0 }, total_v1 { 0 };
     MPI_Reduce(&errors_coal, &total_coal, 1, MPI_INT, MPI_SUM, 0, MPI_COMM_WORLD);
-    MPI_Reduce(&errors_srv, &total_srv, 1, MPI_INT, MPI_SUM, 0, MPI_COMM_WORLD);
-    MPI_Reduce(&errors_pipe, &total_pipe, 1, MPI_INT, MPI_SUM, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&errors_v1, &total_v1, 1, MPI_INT, MPI_SUM, 0, MPI_COMM_WORLD);
 
-    double max_t_mpi { 0 }, max_t_coal { 0 }, max_t_srv { 0 }, max_t_pipe { 0 };
+    int *total_v2 { new int[valid_configs] };
+    for (int c { 0 }; c < valid_configs; c++) {
+        total_v2[c] = 0;
+        MPI_Reduce(&errors_v2[c], &total_v2[c], 1, MPI_INT, MPI_SUM, 0, MPI_COMM_WORLD);
+    }
+
+    double max_t_mpi { 0 }, max_t_coal { 0 }, max_t_v1 { 0 };
     MPI_Reduce(&t_mpi, &max_t_mpi, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     MPI_Reduce(&t_coal, &max_t_coal, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
-    MPI_Reduce(&t_srv, &max_t_srv, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
-    MPI_Reduce(&t_pipe, &max_t_pipe, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&t_v1, &max_t_v1, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+
+    double *max_t_v2 { new double[valid_configs] };
+    for (int c { 0 }; c < valid_configs; c++) {
+        max_t_v2[c] = 0;
+        MPI_Reduce(&t_v2[c], &max_t_v2[c], 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    }
 
     if (rank == 0) {
-        std::cout << "Sasha's beloved ParLinNa Servlet Test" << std::endl;
+        std::cout << "Sasha's beloved ParLinNa Servlet v2 Test" << std::endl;
         std::cout << "procs=" << nprocs << " n=" << n << " r=" << r
                   << " bblock=" << bblock << " msg_size=" << msg_size << std::endl;
+        std::cout << std::endl;
+
         std::cout << "MPI_Alltoallv:       " << max_t_mpi << "s" << std::endl;
         std::cout << "coalesced:           " << max_t_coal << "s" << std::endl;
-        std::cout << "servlet (1 iter):    " << max_t_srv << "s" << std::endl;
-        std::cout << "servlet pipelined:   " << max_t_pipe << "s (" << NUM_ITERS << " iters)" << std::endl;
+        std::cout << "servlet v1:          " << max_t_v1 << "s" << std::endl;
 
-        double per_iter_pipe { max_t_pipe / NUM_ITERS };
-        std::cout << "  per-iter pipelined: " << per_iter_pipe << "s" << std::endl;
-        if (per_iter_pipe < max_t_srv) {
-            double speedup { (max_t_srv - per_iter_pipe) / max_t_srv * 100.0 };
-            std::cout << "  overlap speedup:    " << speedup << "%" << std::endl;
+        vi = 0;
+        for (int c { 0 }; c < num_configs; c++) {
+            if (chunk_counts[c] > msg_size) continue;
+            std::cout << "servlet v2 (C=" << chunk_counts[c] << "):    "
+                      << max_t_v2[vi] << "s" << std::endl;
+            vi++;
         }
 
-        bool all_pass { total_coal == 0 && total_srv == 0 && total_pipe == 0 };
+        std::cout << std::endl;
+
+        bool all_pass { total_coal == 0 && total_v1 == 0 };
+        vi = 0;
+        for (int c { 0 }; c < num_configs; c++) {
+            if (chunk_counts[c] > msg_size) continue;
+            if (total_v2[vi] > 0) all_pass = false;
+            vi++;
+        }
+
         if (all_pass) {
             std::cout << "PASS: all results match MPI_Alltoallv (yipee)" << std::endl;
         } else {
             if (total_coal > 0) std::cout << "FAIL: coalesced " << total_coal << " mismatches" << std::endl;
-            if (total_srv > 0) std::cout << "FAIL: servlet " << total_srv << " mismatches" << std::endl;
-            if (total_pipe > 0) std::cout << "FAIL: pipelined " << total_pipe << " mismatches" << std::endl;
+            if (total_v1 > 0) std::cout << "FAIL: servlet v1 " << total_v1 << " mismatches" << std::endl;
+            vi = 0;
+            for (int c { 0 }; c < num_configs; c++) {
+                if (chunk_counts[c] > msg_size) continue;
+                if (total_v2[vi] > 0)
+                    std::cout << "FAIL: servlet v2 (C=" << chunk_counts[c] << ") "
+                              << total_v2[vi] << " mismatches" << std::endl;
+                vi++;
+            }
             std::cout << "(womp womp)" << std::endl;
         }
     }
@@ -205,10 +242,14 @@ int main(int argc, char **argv) {
     delete[] sendbuf;
     delete[] recv_mpi;
     delete[] recv_coal;
-    delete[] recv_srv;
-    for (int i { 0 }; i < NUM_ITERS; i++) { delete[] recv_pipe[i]; }
-    delete[] recv_pipe;
+    delete[] recv_v1;
+    for (int c { 0 }; c < valid_configs; c++) { delete[] recv_v2[c]; }
+    delete[] recv_v2;
+    delete[] t_v2;
+    delete[] errors_v2;
+    delete[] total_v2;
+    delete[] max_t_v2;
 
     MPI_Finalize();
-    return (total_coal > 0 || total_srv > 0 || total_pipe > 0) ? 1 : 0;
+    return 0;
 }

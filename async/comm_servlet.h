@@ -7,13 +7,12 @@
  * inter-node MPI_Isend/MPI_Irecv on a dedicated NIC-affine core 
  * while the main thread performs computation 
  *
- * all servlet threads on a node share one physical core
+ * double-buffered slot design enables pipelining:
+ * phase 2 of iteration K runs on slot A while
+ * phase 1 of iteration K+1 prepares slot B
  *
- * main thread runs phase 1 intra-node bruck, enqueues phase 2 
- * work, then does useful computation (overlap)
- * 
- * servlet thread dequeues work, posts mpi transfers, drives
- * MPI_Testsome progress loop, signals completion
+ * servlet thread dequeues work from either slot, posts mpi transfers,
+ * drives MPI_Testsome progress loop, signals completion
  *
  *      Author: xshthkr
  */
@@ -24,14 +23,18 @@
 #include <mpi.h>
 #include <pthread.h>
 #include <atomic>
+#include <cstddef>
 
 namespace async_rbruck_alltoallv {
+
+/* number of double-buffer slots for pipelining */
+static const int NUM_SLOTS = 2;
 
 /*
 servlet work states (main thread <-> comm thread handoff)
 
-protocol:
-1. main thread fills desc, stores READY
+protocol per slot:
+1. main thread fills slot desc, stores READY
 2. servlet sees READY, executes transfers, stores DONE
 3. main thread sees DONE, consumes results, stores IDLE
 */
@@ -51,13 +54,11 @@ sizes and displacements in BYTES
 */
 struct CommDescriptor {
     // send side 
-    // packed by phase 1 into temp_send_buffer
     char *send_buf;
     int  *send_sizes;       // [ngroup] byte count per destination node 
     int  *send_displs;      // [ngroup] byte offset per destination node
 
     // recv side 
-    // servlet writes directly into recvbuf
     char *recv_buf;
     int  *recv_sizes;       // [ngroup] byte count per source node  
     int  *recv_displs;      // [ngroup] byte offset per source node 
@@ -76,9 +77,10 @@ struct CommDescriptor {
 config knobs passed to servlet_init()
 */
 struct ServletConfig {
-    int servlet_core_id;        // physical core to pin to (-1 = no pinning)
+    int servlet_core_id;        // physical core to pin to (-1 = no pinning, -2 = auto hwloc NIC-affine)
     int backoff_max_us;         // max idle backoff in microseconds
     int deadlock_timeout_s;     // seconds before fallback MPI_Waitall
+    bool use_hugepages;         // attempt to allocate buffers using MAP_HUGETLB
 };
 
 /*
@@ -86,29 +88,69 @@ returns ServletConfig with sensible defaults
 */
 inline ServletConfig servlet_default_config() {
     ServletConfig c;
-    c.servlet_core_id    = -1;
+    c.servlet_core_id    = -2; // auto detect NIC affinity via hwloc by default
     c.backoff_max_us     = 100;
     c.deadlock_timeout_s = 10;
+    c.use_hugepages      = true;
     return c;
 }
 
 /*
-per-process servlet context
-owns the comm thread and the work descriptor
+one double-buffer slot
 
-cacheline-aligned to prevent false sharing between the atomic state flag
-(written by both threads) and the descriptor fields (written only by main)
+owns the send buffer and sizes/displs arrays on the heap
+so they persist while the servlet reads them asynchronously
+
+also owns phase 1 workspace buffers (extra_buffer, temp_recv_buffer)
+and phase 2 chunk receive buffer (chunk_recv_buffer)
+so they are allocated once and reused across iterations
+
+sizes_storage layout: [send_sizes | send_displs | recv_sizes | recv_displs]
+                       4 * ngroup ints total
+*/
+struct alignas(64) ServletSlot {
+    std::atomic<int> state{static_cast<int>(ServletState::IDLE)};
+
+    CommDescriptor desc;
+
+    // owned send buffer for phase 2 (heap, persists across calls)
+    char  *send_buffer{nullptr};
+    size_t send_buffer_capacity{0};
+
+    // owned sizes/displs storage (heap, 4 * ngroup ints)
+    int   *sizes_storage{nullptr};
+    int    sizes_ngroup{0};
+
+    // phase 1 workspace buffers (heap, reused across calls)
+    char  *extra_buffer{nullptr};
+    size_t extra_buffer_capacity{0};
+
+    char  *temp_recv_buffer{nullptr};
+    size_t temp_recv_buffer_capacity{0};
+
+    // phase 2 contiguous recv buffer for chunking
+    char  *chunk_recv_buffer{nullptr};
+    size_t chunk_recv_buffer_capacity{0};
+
+    // per-slot timing
+    double post_time{0};
+    double progress_time{0};
+    double total_time{0};
+};
+
+/*
+per-process servlet context
+owns the comm thread and the double-buffered work slots
 */
 struct alignas(64) ServletContext {
     // shutdown signal
     std::atomic<bool> shutdown{false};
 
-    // work handoff flag — own cacheline
-    alignas(64) std::atomic<int> state{static_cast<int>(ServletState::IDLE)};
+    // double-buffered work slots
+    ServletSlot slots[NUM_SLOTS];
 
-    // the work descriptor
-    // written by main before READY, read by servlet
-    CommDescriptor desc;
+    // which slot the producer (main thread) writes to next
+    int producer_idx{0};
 
     // config
     ServletConfig config;
@@ -116,12 +158,6 @@ struct alignas(64) ServletContext {
     // thread handle
     pthread_t thread;
     bool      thread_active{false};
-
-    // timing
-    // written by servlet, read by main after DONE
-    double post_time;           // time to post all MPI requests
-    double progress_time;       // time in Testsome loop
-    double total_time;          // READY -> DONE wall time
 };
 
 
@@ -134,29 +170,27 @@ returns 0 on success -1 on error
 int servlet_init(ServletContext *ctx, const ServletConfig *config);
 
 /*
-signal the servlet to exit and join the thread
+signal the servlet to exit, join the thread, free slot buffers
 call once per process, before MPI_Finalize()
 */
 int servlet_shutdown(ServletContext *ctx);
 
-
 /*
-submit the pre-filled descriptor for execution
-caller must have filled ctx -> desc before calling this
+submit the current producer slot for execution
+sets state to READY, toggles producer_idx
 returns immediately, servlet begins work asynchronously
 */
 void servlet_submit(ServletContext *ctx);
 
 /*
-block until the servlet signals completion (state == DONE)
-after return, received data is valid in desc.recv_buf
-resets state to IDLE
+block until ALL in-flight slots complete
+resets completed slots to IDLE
 */
 void servlet_wait(ServletContext *ctx);
 
 /*
 non-blocking completion test
-returns true if servlet has finished (and resets state to IDLE)
+returns true if ALL slots are idle or done (and resets DONE to IDLE)
 */
 bool servlet_test(ServletContext *ctx);
 
