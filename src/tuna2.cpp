@@ -30,11 +30,8 @@ int tuna2_algorithm (int r, int b, char *sendbuf, int *sendcounts, int *sdispls,
 	d = (nlpow*r - nprocs) / nlpow; // calculate the number of highest digits
 	K = w * (r - 1) - d; // the total number of communication rounds
 
-	int rem1 = K + 1, rem2 = r + 1;
-	int sendNcopy[nprocs - rem1];
+	int sendNcopy[nprocs];
 	char *extra_buffer, *temp_recv_buffer, *temp_send_buffer;
-	int extra_ids[nprocs - rem2];
-	memset(extra_ids, -1, sizeof(extra_ids));
 	int spoint = 1, distance = 1, next_distance = distance*r, di = 0;
 
 	if (K < nprocs - 1) {
@@ -48,29 +45,19 @@ int tuna2_algorithm (int r, int b, char *sendbuf, int *sendcounts, int *sdispls,
 		for (i = 0; i < nprocs; i++) { rotate_index_array[i] = (2 * rank - i + nprocs) % nprocs; }
 
 		// 3. exchange data with log(P) steps
-		extra_buffer = (char*) malloc(max_send_count * typesize * (nprocs - rem1));
+		extra_buffer = (char*) malloc(max_send_count * typesize * nprocs);
 		temp_recv_buffer = (char*) malloc(max_send_count * nprocs * typesize);
 	    if (extra_buffer == nullptr || temp_recv_buffer == nullptr) {
 	        std::cerr << "extra_buffer or temp_recv_buffer allocation failed!" << std::endl;
 	        return 1; // Exit program with error
 	    }
-		temp_send_buffer = (char*) malloc(max_send_count * nlpow * typesize);
+		temp_send_buffer = (char*) malloc(max_send_count * nprocs * typesize);
 	    if (temp_send_buffer == nullptr) {
 	        std::cerr << "temp_send_buffer allocation failed!" << std::endl;
 	        return 1; // Exit program with error
 	    }
 
-		for (int x = 0; x < w; x++) {
-			for (int z = 1; z < r; z ++) {
-				spoint = z * distance;
-				if (spoint > nprocs) { break; }
-				int end = (spoint + distance > nprocs)? nprocs : spoint + distance;
-				for (i = spoint + 1; i < end; i++) {
-					extra_ids[i-rem2] = di++;
-				}
-			}
-			distance *= r;
-		}
+
 
 	}
 
@@ -101,7 +88,7 @@ int tuna2_algorithm (int r, int b, char *sendbuf, int *sendcounts, int *sdispls,
     int comm_size[r-1];
 	for (int x = 0; x < w; x++) {
 		ze = (x == w - 1)? r - d: r;
-		int zoffset = 0, zc = ze-1;
+		int zoffset = 0, zoffset_send = 0, zc = ze-1;
 		int zns[zc];
 
 		for (int k = 1; k < ze; k += b) {
@@ -146,13 +133,12 @@ int tuna2_algorithm (int r, int b, char *sendbuf, int *sendcounts, int *sdispls,
 					int sendCount = 0, offset = 0;
 					for (int i = 0; i < di; i++) {
 						int send_index = rotate_index_array[sent_blocks[z-1][i]];
-						int o = (sent_blocks[z-1][i] - rank + nprocs) % nprocs - rem2;
 
 						if (i % distance == 0) {
 							metadata_send[i] = sendcounts[send_index];
 						}
 						else {
-							metadata_send[i] = sendNcopy[extra_ids[o]];
+							metadata_send[i] = sendNcopy[sent_blocks[z-1][i]];
 						}
 						offset += metadata_send[i] * typesize;
 					}
@@ -167,24 +153,24 @@ int tuna2_algorithm (int r, int b, char *sendbuf, int *sendcounts, int *sdispls,
 					offset = 0;
 					for (int i = 0; i < di; i++) {
 						int send_index = rotate_index_array[sent_blocks[z-1][i]];
-						int o = (sent_blocks[z-1][i] - rank + nprocs) % nprocs - rem2;
 						int size = 0;
 
 						if (i % distance == 0) {
 							size = sendcounts[send_index]*typesize;
-							memcpy(&temp_send_buffer[offset], &sendbuf[sdispls[send_index]*typesize], size);
+							memcpy(&temp_send_buffer[zoffset_send + offset], &sendbuf[sdispls[send_index]*typesize], size);
 						}
 						else {
-							size = sendNcopy[extra_ids[o]]*typesize;
-							memcpy(&temp_send_buffer[offset], &extra_buffer[extra_ids[o]*max_send_count*typesize], size);
+							size = sendNcopy[sent_blocks[z-1][i]]*typesize;
+							memcpy(&temp_send_buffer[zoffset_send + offset], &extra_buffer[sent_blocks[z-1][i]*max_send_count*typesize], size);
 						}
 						offset += size;
 					}
 
 					MPI_Irecv(&temp_recv_buffer[zoffset], comm_size[z-1]*typesize, MPI_CHAR, recvrank, recvrank+z, comm, &reqs[num_reqs++]);
-					MPI_Isend(temp_send_buffer, offset, MPI_CHAR, sendrank, rank+z, comm, &reqs[num_reqs++]);
+					MPI_Isend(&temp_send_buffer[zoffset_send], offset, MPI_CHAR, sendrank, rank+z, comm, &reqs[num_reqs++]);
 
 					zoffset += comm_size[z-1]*typesize;
+					zoffset_send += offset;
 				}
 
 			}
@@ -207,14 +193,13 @@ int tuna2_algorithm (int r, int b, char *sendbuf, int *sendcounts, int *sdispls,
 
 					if (zns[i] > 1){
 						int size = metadata_recv[i][j]*typesize;
-						int o = (sent_blocks[i][j] - rank + nprocs) % nprocs - rem2;
 
 						if (j < distance) {
 							memcpy(&recvbuf[rdispls[sent_blocks[i][j]]*typesize], &temp_recv_buffer[offset], size);
 						}
 						else {
-							memcpy(&extra_buffer[extra_ids[o]*max_send_count*typesize], &temp_recv_buffer[offset], size);
-							sendNcopy[extra_ids[o]] = metadata_recv[i][j];
+							memcpy(&extra_buffer[sent_blocks[i][j]*max_send_count*typesize], &temp_recv_buffer[offset], size);
+							sendNcopy[sent_blocks[i][j]] = metadata_recv[i][j];
 						}
 						offset += size;
 					}
