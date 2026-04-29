@@ -336,11 +336,29 @@ int servlet_init(ServletContext *ctx, const ServletConfig *config) {
                 }
 
                 if (servlet_core < 0) {
-                    // fallback to the first available CPU within the allocation
-                    servlet_core = first_allowed;
+                    // fallback to the last allowed CPU so main gets the first
+                    for (int i { CPU_SETSIZE - 1 }; i >= 0; i--) {
+                        if (CPU_ISSET(i, &allowed_cpus)) { servlet_core = i; break; }
+                    }
                 }
 
                 ctx->config.servlet_core_id = servlet_core;
+
+                // pin the main thread to every allowed core EXCEPT the servlet core,
+                // so the two threads don't compete on the same hardware thread.
+                cpu_set_t main_set;
+                CPU_ZERO(&main_set);
+                for (int i { 0 }; i < CPU_SETSIZE; i++) {
+                    if (CPU_ISSET(i, &allowed_cpus) && i != servlet_core) {
+                        CPU_SET(i, &main_set);
+                    }
+                }
+                if (CPU_COUNT(&main_set) > 0) {
+                    pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &main_set);
+                }
+
+                fprintf(stderr, "[comm_servlet] main thread pinned away from servlet core %d\n",
+                        servlet_core);
             } else {
                 // no opportunity to assign a dedicated servlet core
                 ctx->config.servlet_core_id = -1;
