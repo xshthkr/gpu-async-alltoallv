@@ -98,6 +98,10 @@ inline ServletConfig servlet_default_config() {
     return c;
 }
 
+struct ServletSlot;
+struct ServletContext;
+using ServletWorkFn = int (*)(ServletSlot *, ServletContext *);
+
 /*
 one double-buffer slot
 
@@ -111,6 +115,8 @@ so they are allocated once and reused across iterations
 sizes_storage layout: [send_sizes | send_displs | recv_sizes | recv_displs]
                        4 * ngroup ints total
 */
+using ServletWorkFn = int (*)(ServletSlot *, ServletContext *);
+
 struct alignas(64) ServletSlot {
     std::atomic<int> state{static_cast<int>(ServletState::IDLE)};
 
@@ -130,6 +136,25 @@ struct alignas(64) ServletSlot {
 
     char  *temp_recv_buffer{nullptr};
     size_t temp_recv_buffer_capacity{0};
+
+    // phase 1 task state for ParLinNa_servlet_v2
+    ServletWorkFn work_fn{nullptr};
+    char *sendbuf_base{nullptr};
+    int *chunk_sendcounts{nullptr};
+    int *chunk_sdispls{nullptr};
+    int *chunk_recvcounts{nullptr};
+    size_t chunk_recv_bytes{0};
+    size_t chunk_array_capacity{0};
+    int stage1_n{0};
+    int stage1_r{0};
+    int stage1_nprocs{0};
+    int stage1_typesize{0};
+    int stage1_ngroup{0};
+    int stage1_sw{0};
+    int stage1_grank{0};
+    int stage1_gid{0};
+    int stage1_bblock{0};
+    MPI_Comm stage1_comm{MPI_COMM_NULL};
 
     // phase 2 contiguous recv buffer for chunking
     char  *chunk_recv_buffer{nullptr};

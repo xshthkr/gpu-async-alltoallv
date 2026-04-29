@@ -66,6 +66,18 @@ static void wait_slot_available(ServletSlot *slot) {
 	}
 }
 
+static void ensure_slot_phase1_capacity(ServletSlot *slot, int nprocs) {
+	if (nprocs > slot->chunk_array_capacity) {
+		if (slot->chunk_sendcounts) free(slot->chunk_sendcounts);
+		if (slot->chunk_sdispls) free(slot->chunk_sdispls);
+		if (slot->chunk_recvcounts) free(slot->chunk_recvcounts);
+		slot->chunk_sendcounts = (int*) malloc(nprocs * sizeof(int));
+		slot->chunk_sdispls = (int*) malloc(nprocs * sizeof(int));
+		slot->chunk_recvcounts = (int*) malloc(nprocs * sizeof(int));
+		slot->chunk_array_capacity = nprocs;
+	}
+}
+
 static void ensure_slot_capacity(
 	ServletSlot *slot, size_t send_bytes, int ngroup,
 	size_t extra_bytes, size_t temp_recv_bytes,
@@ -106,13 +118,24 @@ static void ensure_slot_capacity(
 run phase 1 bruck on a chunk, pack the slot descriptor for phase 2
 phase 2 receives into slot->chunk_recv_buffer (contiguous temp buffer)
 */
-static int run_phase1_chunk(
-	int n, int r, int nprocs, int typesize,
-	int ngroup, int sw, int grank, int gid,
-	char *sendbuf_base, int *chunk_sendcounts, int *chunk_sdispls,
-	int *chunk_recvcounts, size_t chunk_recv_bytes,
-	MPI_Comm comm, int bblock, ServletSlot *slot, ServletContext *servlet_ctx)
+static int run_phase1_chunk(ServletSlot *slot, ServletContext *servlet_ctx)
 {
+	int n { slot->stage1_n };
+	int r { slot->stage1_r };
+	int nprocs { slot->stage1_nprocs };
+	int typesize { slot->stage1_typesize };
+	int ngroup { slot->stage1_ngroup };
+	int sw { slot->stage1_sw };
+	int grank { slot->stage1_grank };
+	int gid { slot->stage1_gid };
+	int bblock { slot->stage1_bblock };
+	char *sendbuf_base { slot->sendbuf_base };
+	int *chunk_sendcounts { slot->chunk_sendcounts };
+	int *chunk_sdispls { slot->chunk_sdispls };
+	int *chunk_recvcounts { slot->chunk_recvcounts };
+	size_t chunk_recv_bytes { slot->chunk_recv_bytes };
+	MPI_Comm comm { slot->stage1_comm };
+
 	int imax { rbruck_alltoallv_utils::pow(r, sw-1) * ngroup };
 	int max_sd { (ngroup > imax) ? ngroup : imax };
 
@@ -356,9 +379,24 @@ int ParLinNa_servlet_v2(
 		size_t total_recv { 0 };
 		for (int i { 0 }; i < nprocs; i++) total_recv += recvcounts[i];
 
-		run_phase1_chunk(n, r, nprocs, typesize, ngroup, sw, grank, gid,
-						 sendbuf, sendcounts, sdispls, chunk_recvcounts,
-						 total_recv * typesize, comm, bblock, slot, servlet_ctx);
+		ensure_slot_phase1_capacity(slot, nprocs);
+		slot->work_fn = run_phase1_chunk;
+		slot->sendbuf_base = sendbuf;
+		memcpy(slot->chunk_sendcounts, sendcounts, nprocs * sizeof(int));
+		memcpy(slot->chunk_sdispls, sdispls, nprocs * sizeof(int));
+		memcpy(slot->chunk_recvcounts, chunk_recvcounts, nprocs * sizeof(int));
+		slot->chunk_recv_bytes = total_recv * typesize;
+		slot->stage1_n = n;
+		slot->stage1_r = r;
+		slot->stage1_nprocs = nprocs;
+		slot->stage1_typesize = typesize;
+		slot->stage1_ngroup = ngroup;
+		slot->stage1_sw = sw;
+		slot->stage1_grank = grank;
+		slot->stage1_gid = gid;
+		slot->stage1_bblock = bblock;
+		slot->stage1_comm = comm;
+
 		st = MPI_Wtime();
 		servlet_submit(servlet_ctx);
 		et = MPI_Wtime();
@@ -440,10 +478,23 @@ int ParLinNa_servlet_v2(
 		}
 		slot_chunk_ids[slot_idx] = c;
 
-		run_phase1_chunk(n, r, nprocs, typesize, ngroup, sw, grank, gid,
-						 sendbuf, chunk_sendcounts, chunk_sdispls,
-						 chunk_recvcounts, chunk_total_recv * typesize,
-						 comm, bblock, slot, servlet_ctx);
+		ensure_slot_phase1_capacity(slot, nprocs);
+		slot->work_fn = run_phase1_chunk;
+		slot->sendbuf_base = sendbuf;
+		memcpy(slot->chunk_sendcounts, chunk_sendcounts, nprocs * sizeof(int));
+		memcpy(slot->chunk_sdispls, chunk_sdispls, nprocs * sizeof(int));
+		memcpy(slot->chunk_recvcounts, chunk_recvcounts, nprocs * sizeof(int));
+		slot->chunk_recv_bytes = chunk_total_recv * typesize;
+		slot->stage1_n = n;
+		slot->stage1_r = r;
+		slot->stage1_nprocs = nprocs;
+		slot->stage1_typesize = typesize;
+		slot->stage1_ngroup = ngroup;
+		slot->stage1_sw = sw;
+		slot->stage1_grank = grank;
+		slot->stage1_gid = gid;
+		slot->stage1_bblock = bblock;
+		slot->stage1_comm = comm;
 
 		st = MPI_Wtime();
 		servlet_submit(servlet_ctx);

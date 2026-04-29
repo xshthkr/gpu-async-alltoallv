@@ -233,6 +233,11 @@ static void *servlet_thread_fn(void *arg) {
                 ctx->slots[s].post_time = 0;
                 ctx->slots[s].progress_time = 0;
 
+                if (ctx->slots[s].work_fn) {
+                    ctx->slots[s].work_fn(&ctx->slots[s], ctx);
+                    ctx->slots[s].work_fn = nullptr;
+                }
+
                 execute_transfers(&ctx->slots[s], &ctx->config);
 
                 ctx->slots[s].total_time = MPI_Wtime() - t0;
@@ -465,6 +470,18 @@ int servlet_shutdown(ServletContext *ctx) {
         if (ctx->slots[i].chunk_recv_buffer) {
             servlet_free(ctx->slots[i].chunk_recv_buffer);
             ctx->slots[i].chunk_recv_buffer = nullptr;
+        }
+        if (ctx->slots[i].chunk_sendcounts) {
+            free(ctx->slots[i].chunk_sendcounts);
+            ctx->slots[i].chunk_sendcounts = nullptr;
+        }
+        if (ctx->slots[i].chunk_sdispls) {
+            free(ctx->slots[i].chunk_sdispls);
+            ctx->slots[i].chunk_sdispls = nullptr;
+        }
+        if (ctx->slots[i].chunk_recvcounts) {
+            free(ctx->slots[i].chunk_recvcounts);
+            ctx->slots[i].chunk_recvcounts = nullptr;
         }
     }
 
