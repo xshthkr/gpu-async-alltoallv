@@ -312,55 +312,40 @@ int servlet_init(ServletContext *ctx, const ServletConfig *config) {
     // auto-detect SLURM cpusets if requested
     if (ctx->config.servlet_core_id == -2) {
         cpu_set_t allowed_cpus;
-        sched_getaffinity(0, sizeof(cpu_set_t), &allowed_cpus);
-
-        int first_cpu { -1 };
-        int second_cpu { -1 };
-
-        for (int i { 0 }; i < CPU_SETSIZE; i++) {
-            if (CPU_ISSET(i, &allowed_cpus)) {
-                if (first_cpu == -1) first_cpu = i;
-                else if (second_cpu == -1) {
-                    second_cpu = i;
-                    break;
+        if (sched_getaffinity(0, sizeof(cpu_set_t), &allowed_cpus) == 0) {
+            int allowed_count { 0 };
+            int first_allowed { -1 };
+            for (int i { 0 }; i < CPU_SETSIZE; i++) {
+                if (CPU_ISSET(i, &allowed_cpus)) {
+                    if (first_allowed == -1) first_allowed = i;
+                    allowed_count++;
                 }
             }
-        }
 
-        if (first_cpu != -1 && second_cpu != -1) {
-            int main_core = first_cpu;
-            int servlet_core = second_cpu;
-
-            hwloc_bitmap_t nic_cpuset = get_nic_cpuset();
-            if (nic_cpuset) {
-                bool first_in_nic = hwloc_bitmap_isset(nic_cpuset, first_cpu);
-                bool second_in_nic = hwloc_bitmap_isset(nic_cpuset, second_cpu);
-
-                if (first_in_nic && !second_in_nic) {
-                    // Swap so servlet_core gets the NIC-affine one
-                    main_core = second_cpu;
-                    servlet_core = first_cpu;
+            if (allowed_count > 1) {
+                int servlet_core { -1 };
+                hwloc_bitmap_t nic_cpuset = get_nic_cpuset();
+                if (nic_cpuset) {
+                    for (int i { 0 }; i < CPU_SETSIZE; i++) {
+                        if (CPU_ISSET(i, &allowed_cpus) && hwloc_bitmap_isset(nic_cpuset, i)) {
+                            servlet_core = i;
+                            break;
+                        }
+                    }
+                    hwloc_bitmap_free(nic_cpuset);
                 }
-                hwloc_bitmap_free(nic_cpuset);
+
+                if (servlet_core < 0) {
+                    // fallback to the first available CPU within the allocation
+                    servlet_core = first_allowed;
+                }
+
+                ctx->config.servlet_core_id = servlet_core;
+            } else {
+                // no opportunity to assign a dedicated servlet core
+                ctx->config.servlet_core_id = -1;
             }
-
-            // pin main compute thread to main_core
-            cpu_set_t main_set;
-            CPU_ZERO(&main_set);
-            CPU_SET(main_core, &main_set);
-            pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &main_set);
-
-            // tell servlet to pin background thread to servlet_core
-            ctx->config.servlet_core_id = servlet_core;
-        } else if (first_cpu != -1) {
-            // only one core available, pin main to it and don't pin servlet
-            cpu_set_t main_set;
-            CPU_ZERO(&main_set);
-            CPU_SET(first_cpu, &main_set);
-            pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &main_set);
-            ctx->config.servlet_core_id = -1;
         } else {
-            // fallback if we didn't get any CPUs
             ctx->config.servlet_core_id = -1;
         }
     }
