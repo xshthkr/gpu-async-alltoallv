@@ -47,3 +47,5 @@ target_link_libraries(servlet_test_v2_chunk_configs
     MPI::MPI_CXX
     Threads::Threads
 )
+
+# add_compile_options(-rdynamic -O0 -fsanitize=address -fno-omit-frame-pointer -g)

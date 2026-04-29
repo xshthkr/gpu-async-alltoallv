@@ -25,6 +25,18 @@
 #include <cstdlib>
 #include <algorithm>
 
+#define CHECK_CALL(call) \
+  do { \
+    int err = call; \
+    if (err != MPI_SUCCESS) { \
+      char errstr[MPI_MAX_ERROR_STRING]; \
+      int errlen; \
+      MPI_Error_string(err, errstr, &errlen); \
+      fprintf(stderr, "[%s:%d] MPI error: %s\n", __FILE__, __LINE__, errstr); \
+      MPI_Abort(MPI_COMM_WORLD, err); \
+    } \
+  } while (0)
+
 namespace async_rbruck_alltoallv {
 
 static double init_time        { 0 };
@@ -84,6 +96,10 @@ static void ensure_slot_capacity(
 		slot->chunk_recv_buffer = (char*) servlet_malloc(chunk_recv_bytes, use_hugepages);
 		slot->chunk_recv_buffer_capacity = chunk_recv_bytes;
 	}
+	// if (!(slot->send_buffer) || !(slot->sizes_storage) || !(slot->extra_buffer) || !(slot->temp_recv_buffer) || !(slot->chunk_recv_buffer)) {
+	// 	fprintf(stderr, "ERROR: malloc failed!\n");
+    // 		MPI_Abort(MPI_COMM_WORLD, 1);
+	// }
 }
 
 /*
@@ -115,7 +131,8 @@ static int run_phase1_chunk(
 		if (chunk_sendcounts[i] > local_max_count)
 			local_max_count = chunk_sendcounts[i];
 	}
-	MPI_Allreduce(&local_max_count, &max_send_count, 1, MPI_INT, MPI_MAX, comm);
+	// CHECK_CALL(MPI_Allreduce(&local_max_count, &max_send_count, 1, MPI_INT, MPI_MAX, comm));
+    MPI_Allreduce(&local_max_count, &max_send_count, 1, MPI_INT, MPI_MAX, comm);
 	et = MPI_Wtime();
 	findMax_time += et - st;
 
@@ -191,6 +208,9 @@ static int run_phase1_chunk(
 
 			st = MPI_Wtime();
 			int metadata_recv[di];
+			// CHECK_CALL(MPI_Sendrecv(metadata_send, di, MPI_INT, send_proc, 0,
+			// 			 metadata_recv, di, MPI_INT, recv_proc, 0,
+			// 			 comm, MPI_STATUS_IGNORE));
 			MPI_Sendrecv(metadata_send, di, MPI_INT, send_proc, 0,
 						 metadata_recv, di, MPI_INT, recv_proc, 0,
 						 comm, MPI_STATUS_IGNORE);
@@ -199,6 +219,9 @@ static int run_phase1_chunk(
 			excgMeta_time += et - st;
 
 			st = MPI_Wtime();
+			// CHECK_CALL(MPI_Sendrecv(temp_send_buffer, offset, MPI_CHAR, send_proc, 1,
+			// 			 temp_recv_buffer, sendCount * typesize, MPI_CHAR, recv_proc, 1,
+			// 			 comm, MPI_STATUS_IGNORE));
 			MPI_Sendrecv(temp_send_buffer, offset, MPI_CHAR, send_proc, 1,
 						 temp_recv_buffer, sendCount * typesize, MPI_CHAR, recv_proc, 1,
 						 comm, MPI_STATUS_IGNORE);

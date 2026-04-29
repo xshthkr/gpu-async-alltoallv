@@ -25,7 +25,33 @@
 #include <cstring>
 #include <mpi.h>
 
+// #include <signal.h>
+// #include <execinfo.h>
+// 
+// void crash_handler(int sig) {
+//     // only print once per process to avoid flooding
+//     static std::atomic<bool> handling{false};
+//     if (handling.exchange(true)) return;
+//     int rank;
+//     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+//     fprintf(stderr, "\n[Rank %d] CRASH: Signal %d (%s)\n", rank, sig, strsignal(sig));
+//     // print backtrace
+//     void *array[50];
+//     int size = backtrace(array, 50);
+//     backtrace_symbols_fd(array, size, STDERR_FILENO);
+//     // sleep to ensure output is flushed before abort
+//     sleep(1);
+//     exit(1);
+// }
+
 int main(int argc, char **argv) {
+	// register crash handlers for common fatal signals
+	// signal(SIGSEGV, crash_handler);  // segmentation fault
+	// signal(SIGBUS, crash_handler);   // bus error (invalid memory access)
+	// signal(SIGABRT, crash_handler);  // abort
+	// signal(SIGFPE, crash_handler);   // floating point error
+
+
     int provided;
     MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
     if (provided < MPI_THREAD_MULTIPLE) {
@@ -137,6 +163,7 @@ int main(int argc, char **argv) {
                 }
 
                 async_rbruck_alltoallv::ServletConfig cfg { async_rbruck_alltoallv::servlet_default_config() };
+		        // cfg.servlet_core_id = -1;	// disable pinning
                 async_rbruck_alltoallv::ServletContext servlet_ctx;
                 if (async_rbruck_alltoallv::servlet_init(&servlet_ctx, &cfg) != 0) {
                     if (rank == 0) {

@@ -15,6 +15,18 @@
 #include <sys/mman.h>
 #include <hwloc.h>
 
+#define CHECK_CALL(call) \
+  do { \
+    int err = call; \
+    if (err != MPI_SUCCESS) { \
+      char errstr[MPI_MAX_ERROR_STRING]; \
+      int errlen; \
+      MPI_Error_string(err, errstr, &errlen); \
+      fprintf(stderr, "[%s:%d] MPI error: %s\n", __FILE__, __LINE__, errstr); \
+      MPI_Abort(MPI_COMM_WORLD, err); \
+    } \
+  } while (0)
+
 namespace async_rbruck_alltoallv {
 
 /*
@@ -61,6 +73,10 @@ void* servlet_malloc(size_t size, bool use_hugepages) {
     if (posix_memalign(&ptr, 2 * 1024 * 1024, size) != 0) {
         ptr = malloc(size); // fallback
     }
+    // if (!ptr) {
+	// fprintf(stderr, "ERROR: malloc failed for size %zu\n", size);
+    // 	MPI_Abort(MPI_COMM_WORLD, 1);
+    // }
     if (ptr && use_hugepages) {
         // Advise kernel to use hugepages for this mapping
         madvise(ptr, size, MADV_HUGEPAGE);
@@ -114,6 +130,7 @@ static void execute_transfers(ServletSlot *slot, const ServletConfig *config) {
             int nsrc { (gid + i + ii) % ngroup };
             int src { nsrc * n + grank };
 
+            // CHECK_CALL(MPI_Irecv(&desc->recv_buf[desc->recv_displs[nsrc]], desc->recv_sizes[nsrc], MPI_CHAR, src, 2, comm, &reqs[req_cnt++]));
             MPI_Irecv(&desc->recv_buf[desc->recv_displs[nsrc]], desc->recv_sizes[nsrc], MPI_CHAR, src, 2, comm, &reqs[req_cnt++]);
         }
 
@@ -122,7 +139,7 @@ static void execute_transfers(ServletSlot *slot, const ServletConfig *config) {
             int ndst { (gid - i - ii + ngroup) % ngroup };
             int dst { ndst * n + grank };
 
-            MPI_Isend(&desc->send_buf[desc->send_displs[ndst]], desc->send_sizes[ndst], MPI_CHAR, dst, 2, comm, &reqs[req_cnt++]);
+            CHECK_CALL(MPI_Isend(&desc->send_buf[desc->send_displs[ndst]], desc->send_sizes[ndst], MPI_CHAR, dst, 2, comm, &reqs[req_cnt++]));
         }
 
         double post_end { MPI_Wtime() };
