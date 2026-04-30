@@ -55,15 +55,49 @@ static double SP_time          { 0 };
 extern void* servlet_malloc(size_t size, bool use_hugepages);
 extern void servlet_free(void *ptr);
 
-static void wait_slot_available(ServletSlot *slot) {
+static bool wait_slot_available(ServletSlot *slot) {
 	while (true) {
 		int s { slot->state.load(std::memory_order_acquire) };
-		if (s == static_cast<int>(ServletState::IDLE)) return;
+		if (s == static_cast<int>(ServletState::IDLE)) return false;
 		if (s == static_cast<int>(ServletState::DONE)) {
 			slot->state.store(static_cast<int>(ServletState::IDLE), std::memory_order_release);
-			return;
+			return true;
 		}
 	}
+}
+
+static void scatter_chunk_recv_buffer(ServletSlot *slot) {
+	if (!(slot->final_recvbuf) || !(slot->final_recvcounts) || !(slot->final_rdispls)) return;
+
+	int n { slot->desc.n };
+	int ngroup { slot->desc.ngroup };
+	int num_chunks { slot->num_chunks };
+	int chunk_id { slot->chunk_id };
+	int typesize { slot->typesize };
+	char *dst_base { slot->final_recvbuf };
+	int *recvcounts { slot->final_recvcounts };
+	int *rdispls { slot->final_rdispls };
+	char *src { slot->chunk_recv_buffer };
+
+	int offset { 0 };
+	for (int i { 0 }; i < ngroup; i++) {
+		for (int j { 0 }; j < n; j++) {
+			int id { i * n + j };
+			int base_r { recvcounts[id] / num_chunks };
+			int rem_r  { recvcounts[id] % num_chunks };
+			int chunk_offset { chunk_id * base_r + std::min(chunk_id, rem_r) };
+			int count { base_r + (chunk_id < rem_r ? 1 : 0) };
+			if (count > 0) {
+				memcpy(dst_base + (rdispls[id] + chunk_offset) * typesize,
+				       &src[offset], count * typesize);
+				offset += count * typesize;
+			}
+		}
+	}
+
+	slot->final_recvbuf = nullptr;
+	slot->final_recvcounts = nullptr;
+	slot->final_rdispls = nullptr;
 }
 
 static void ensure_slot_capacity(
@@ -104,15 +138,19 @@ static void ensure_slot_capacity(
 
 /*
 run phase 1 bruck on a chunk, pack the slot descriptor for phase 2
-phase 2 receives into slot->chunk_recv_buffer (contiguous temp buffer)
+phase 2 receives directly into the final recvbuf using per-group byte offsets
 */
 static int run_phase1_chunk(
 	int n, int r, int nprocs, int typesize,
 	int ngroup, int sw, int grank, int gid,
 	char *sendbuf_base, int *chunk_sendcounts, int *chunk_sdispls,
 	int *chunk_recvcounts, size_t chunk_recv_bytes,
-	MPI_Comm comm, int bblock, ServletSlot *slot, ServletContext *servlet_ctx)
+	char *recvbuf, int *recvcounts, int *rdispls,
+	int chunk_id, int num_chunks,
+	MPI_Comm comm, MPI_Comm local_comm, int bblock, ServletSlot *slot, ServletContext *servlet_ctx)
 {
+	int rank;
+	MPI_Comm_rank(comm, &rank);
 	int imax { rbruck_alltoallv_utils::pow(r, sw-1) * ngroup };
 	int max_sd { (ngroup > imax) ? ngroup : imax };
 
@@ -131,6 +169,10 @@ static int run_phase1_chunk(
 		if (chunk_sendcounts[i] > local_max_count)
 			local_max_count = chunk_sendcounts[i];
 	}
+	et = MPI_Wtime();
+	init_time += et - st;
+
+	st = MPI_Wtime();
 	// CHECK_CALL(MPI_Allreduce(&local_max_count, &max_send_count, 1, MPI_INT, MPI_MAX, comm));
     MPI_Allreduce(&local_max_count, &max_send_count, 1, MPI_INT, MPI_MAX, comm);
 	et = MPI_Wtime();
@@ -213,7 +255,7 @@ static int run_phase1_chunk(
 			// 			 comm, MPI_STATUS_IGNORE));
 			MPI_Sendrecv(metadata_send, di, MPI_INT, send_proc, 0,
 						 metadata_recv, di, MPI_INT, recv_proc, 0,
-						 comm, MPI_STATUS_IGNORE);
+						 local_comm, MPI_STATUS_IGNORE);
 			for (int i { 0 }; i < di; i++) sendCount += metadata_recv[i];
 			et = MPI_Wtime();
 			excgMeta_time += et - st;
@@ -224,7 +266,7 @@ static int run_phase1_chunk(
 			// 			 comm, MPI_STATUS_IGNORE));
 			MPI_Sendrecv(temp_send_buffer, offset, MPI_CHAR, send_proc, 1,
 						 temp_recv_buffer, sendCount * typesize, MPI_CHAR, recv_proc, 1,
-						 comm, MPI_STATUS_IGNORE);
+						 local_comm, MPI_STATUS_IGNORE);
 			et = MPI_Wtime();
 			excgData_time += et - st;
 
@@ -262,13 +304,14 @@ static int run_phase1_chunk(
 	orgData_time += et - st;
 
 	st = MPI_Wtime();
-	// compute per-node sizes/displs into slot storage (contiguous layout, offset 0)
+	// compute per-node sizes/displs into slot storage (final recvbuf layout)
 	int *send_sizes  { &slot->sizes_storage[0] };
 	int *send_displs { &slot->sizes_storage[ngroup] };
 	int *recv_sizes  { &slot->sizes_storage[2 * ngroup] };
 	int *recv_displs { &slot->sizes_storage[3 * ngroup] };
 
-	int soff { 0 }, roff { 0 };
+	int soff { 0 };
+	int roffset { 0 };
 	for (int i { 0 }; i < ngroup; i++) {
 		int nsend { 0 }, nrecv { 0 };
 		for (int j { 0 }; j < n; j++) {
@@ -279,22 +322,46 @@ static int run_phase1_chunk(
 		send_sizes[i]  = nsend * typesize;
 		send_displs[i] = soff;
 		recv_sizes[i]  = nrecv * typesize;
-		recv_displs[i] = roff;
+
+		int first_rank { i * n };
+		int group_offset { 0 };
+		for (int j { 0 }; j < n; j++) {
+			int id { first_rank + j };
+			int base_r { recvcounts[id] / num_chunks };
+			int rem_r  { recvcounts[id] % num_chunks };
+			int chunk_offset { chunk_id * base_r + std::min(chunk_id, rem_r) };
+			group_offset += chunk_offset;
+		}
+		if (num_chunks == 1) {
+			recv_displs[i] = (rdispls[first_rank] + group_offset) * typesize;
+		} else {
+			recv_displs[i] = roffset;
+		}
 		soff += send_sizes[i];
-		roff += recv_sizes[i];
+		roffset += recv_sizes[i];
 	}
 	et = MPI_Wtime();
 	prepSP_time += et - st;
 
 	st = MPI_Wtime();
-	// fill descriptor — recv into temp buffer (contiguous), NOT final recvbuf
 	CommDescriptor *desc { &slot->desc };
 	desc->send_buf    = temp_send_buffer;
 	desc->send_sizes  = send_sizes;
 	desc->send_displs = send_displs;
-	desc->recv_buf    = slot->chunk_recv_buffer;
 	desc->recv_sizes  = recv_sizes;
-	desc->recv_displs = recv_displs;
+	if (num_chunks == 1) {
+		desc->recv_buf    = recvbuf;
+		desc->recv_displs = recv_displs;
+	} else {
+		desc->recv_buf    = slot->chunk_recv_buffer;
+		desc->recv_displs = recv_displs;
+		slot->final_recvbuf = recvbuf;
+		slot->final_recvcounts = recvcounts;
+		slot->final_rdispls = rdispls;
+		slot->chunk_id = chunk_id;
+		slot->num_chunks = num_chunks;
+		slot->typesize = typesize;
+	}
 	desc->ngroup      = ngroup;
 	desc->n           = n;
 	desc->gid         = gid;
@@ -326,10 +393,30 @@ int ParLinNa_servlet_v2(
 	int typesize;
 	MPI_Type_size(sendtype, &typesize);
 
+	MPI_Comm local_comm;
+	MPI_Comm_split_type(comm, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL, &local_comm);
+	int local_rank { 0 };
+	int local_size { 0 };
+	MPI_Comm_rank(local_comm, &local_rank);
+	MPI_Comm_size(local_comm, &local_size);
+
+	if (local_size != n) {
+		if (rank == 0) {
+			std::cerr << "ERROR: detected " << local_size
+				<< " ranks on this node but ncores=" << n << " was requested" << std::endl;
+		}
+		MPI_Abort(comm, 1);
+	}
+
+	int grank { local_rank };
 	int ngroup { nprocs / n };
 	int sw { static_cast<int>(ceil(log(n) / float(log(r)))) };
-	int grank { rank % n };
-	int gid { rank / n };
+
+	MPI_Comm node_id_comm;
+	MPI_Comm_split(comm, local_rank, rank, &node_id_comm);
+	int gid { 0 };
+	MPI_Comm_rank(node_id_comm, &gid);
+	MPI_Comm_free(&node_id_comm);
 
 	et = MPI_Wtime();
 	init_time += et - st;
@@ -350,39 +437,21 @@ int ParLinNa_servlet_v2(
 
 		run_phase1_chunk(n, r, nprocs, typesize, ngroup, sw, grank, gid,
 						 sendbuf, sendcounts, sdispls, chunk_recvcounts,
-						 total_recv * typesize, comm, bblock, slot, servlet_ctx);
+						 total_recv * typesize, recvbuf, recvcounts, rdispls, 0, 1, comm, local_comm, bblock, slot, servlet_ctx);
 		st = MPI_Wtime();
 		servlet_submit(servlet_ctx);
 		et = MPI_Wtime();
 		SP_time += et - st;
 		servlet_wait(servlet_ctx);
 
-		// scatter from contiguous temp buffer to recvbuf using rdispls
-		int roff { 0 };
-		for (int g { 0 }; g < ngroup; g++) {
-			for (int j { 0 }; j < n; j++) {
-				int rid { g * n + j };
-				memcpy(recvbuf + rdispls[rid] * typesize,
-					   slot->chunk_recv_buffer + roff,
-					   recvcounts[rid] * typesize);
-				roff += recvcounts[rid] * typesize;
-			}
-		}
-
 		delete[] chunk_recvcounts;
+		MPI_Comm_free(&local_comm);
 		return 0;
 	}
 
 	int *chunk_sendcounts { new int[nprocs] };
 	int *chunk_sdispls    { new int[nprocs] };
 	int *chunk_recvcounts { new int[nprocs] };
-
-	// per-chunk recv layout info for the final scatter
-	int **chunk_recv_offsets { new int*[num_chunks] };
-	int **chunk_recv_counts_saved { new int*[num_chunks] };
-
-	int slot_chunk_ids[NUM_SLOTS];
-	for (int i { 0 }; i < NUM_SLOTS; i++) { slot_chunk_ids[i] = -1; }
 
 	for (int c { 0 }; c < num_chunks; c++) {
 		// compute this chunk's counts and displacements
@@ -399,44 +468,17 @@ int ParLinNa_servlet_v2(
 			chunk_total_recv += chunk_recvcounts[i];
 		}
 
-		// save per-rank recv counts and compute per-rank offsets within the temp buffer
-		chunk_recv_offsets[c] = new int[nprocs];
-		chunk_recv_counts_saved[c] = new int[nprocs];
-		memcpy(chunk_recv_counts_saved[c], chunk_recvcounts, nprocs * sizeof(int));
-
-		int roff { 0 };
-		for (int g { 0 }; g < ngroup; g++) {
-			for (int j { 0 }; j < n; j++) {
-				int rid { g * n + j };
-				chunk_recv_offsets[c][rid] = roff;
-				roff += chunk_recvcounts[rid] * typesize;
-			}
-		}
-
-		// acquire slot
 		int slot_idx { servlet_ctx->producer_idx };
 		ServletSlot *slot { &servlet_ctx->slots[slot_idx] };
-		wait_slot_available(slot);
-
-		// OVERLAP FINAL SCATTER: if this slot was previously used, scatter its data now
-		// while the servlet is busy processing the other slot in the background
-		if (slot_chunk_ids[slot_idx] != -1) {
-			int prev_c { slot_chunk_ids[slot_idx] };
-			for (int p { 0 }; p < nprocs; p++) {
-				int base_r { recvcounts[p] / num_chunks };
-				int rem_r { recvcounts[p] % num_chunks };
-				int r_off { prev_c * base_r + std::min(prev_c, rem_r) };
-
-				memcpy(recvbuf + (rdispls[p] + r_off) * typesize, slot->chunk_recv_buffer + chunk_recv_offsets[prev_c][p], chunk_recv_counts_saved[prev_c][p] * typesize);
-			}
+		if (wait_slot_available(slot)) {
+			scatter_chunk_recv_buffer(slot);
 		}
-		slot_chunk_ids[slot_idx] = c;
 
 		run_phase1_chunk(n, r, nprocs, typesize, ngroup, sw, grank, gid,
-						 sendbuf, chunk_sendcounts, chunk_sdispls,
-						 chunk_recvcounts, chunk_total_recv * typesize,
-						 comm, bblock, slot, servlet_ctx);
-
+				sendbuf, chunk_sendcounts, chunk_sdispls,
+				chunk_recvcounts, chunk_total_recv * typesize,
+				recvbuf, recvcounts, rdispls, c, num_chunks,
+				comm, local_comm, bblock, slot, servlet_ctx);
 		st = MPI_Wtime();
 		servlet_submit(servlet_ctx);
 		et = MPI_Wtime();
@@ -445,34 +487,15 @@ int ParLinNa_servlet_v2(
 
 	// wait for all in-flight chunks to complete
 	servlet_wait(servlet_ctx);
-
-	// scatter the remaining chunks that were left in the slots
-	for (int i { 0 }; i < NUM_SLOTS; i++) {
-		if (slot_chunk_ids[i] != -1) {
-			int prev_c = slot_chunk_ids[i];
-			for (int p { 0 }; p < nprocs; p++) {
-				int base_r { recvcounts[p] / num_chunks };
-				int rem_r  { recvcounts[p] % num_chunks };
-				int r_off  { prev_c * base_r + std::min(prev_c, rem_r) };
-
-				memcpy(recvbuf + (rdispls[p] + r_off) * typesize,
-					   servlet_ctx->slots[i].chunk_recv_buffer + chunk_recv_offsets[prev_c][p],
-					   chunk_recv_counts_saved[prev_c][p] * typesize);
-			}
-		}
+	for (int s { 0 }; s < NUM_SLOTS; s++) {
+		scatter_chunk_recv_buffer(&servlet_ctx->slots[s]);
 	}
 
-	for (int c { 0 }; c < num_chunks; c++) {
-		delete[] chunk_recv_offsets[c];
-		delete[] chunk_recv_counts_saved[c];
-	}
-
-	delete[] chunk_recv_offsets;
-	delete[] chunk_recv_counts_saved;
 	delete[] chunk_sendcounts;
 	delete[] chunk_sdispls;
 	delete[] chunk_recvcounts;
 
+	MPI_Comm_free(&local_comm);
 	return 0;
 }
 

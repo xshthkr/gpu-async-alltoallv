@@ -132,6 +132,14 @@ struct alignas(64) ServletSlot {
     char  *chunk_recv_buffer{nullptr};
     size_t chunk_recv_buffer_capacity{0};
 
+    // chunked receive scatter metadata
+    char  *final_recvbuf{nullptr};
+    int   *final_recvcounts{nullptr};
+    int   *final_rdispls{nullptr};
+    int    chunk_id{0};
+    int    num_chunks{0};
+    int    typesize{0};
+
     // per-slot timing
     double post_time{0};
     double progress_time{0};

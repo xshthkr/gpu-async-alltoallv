@@ -177,8 +177,8 @@ int main(int argc, char **argv) {
 
                 for (int it { 0 }; it < loopcount; ++it) {
                     for (int num_chunks : chunk_counts) {
-                        long long *recv_srv = new long long[roffset];
-                        std::memset(recv_srv, 0, roffset * sizeof(long long));
+                    long long *recv_srv = new long long[roffset];
+                    std::memset(recv_srv, 0, roffset * sizeof(long long));
 
                         MPI_Barrier(MPI_COMM_WORLD);
                         t0 = MPI_Wtime();
@@ -201,6 +201,9 @@ int main(int argc, char **argv) {
                             if (recv_srv[i] != recv_mpi[i]) {
                                 local_errors += 1;
                             }
+                        }
+                        if (local_errors > 0) {
+                            // nothing extra to print here
                         }
                         int global_errors { 0 };
                         MPI_Allreduce(&local_errors, &global_errors, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
