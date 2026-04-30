@@ -23,6 +23,7 @@
 #include <vector>
 #include <cstdlib>
 #include <cstring>
+#include <sstream>
 #include <mpi.h>
 
 // #include <signal.h>
@@ -206,13 +207,23 @@ int main(int argc, char **argv) {
                         }
 
                         int local_errors { 0 };
+                        int first_mismatch_index { -1 };
                         for (int i { 0 }; i < roffset; ++i) {
                             if (recv_srv[i] != recv_mpi[i]) {
                                 local_errors += 1;
+                                if (first_mismatch_index == -1) {
+                                    first_mismatch_index = i;
+                                }
                             }
                         }
                         if (local_errors > 0) {
-                            // nothing extra to print here
+                            std::ostringstream mismatch;
+                            mismatch << "[MISMATCH rank=" << rank
+                                     << " idx=" << first_mismatch_index
+                                     << " expected=" << recv_mpi[first_mismatch_index]
+                                     << " got=" << recv_srv[first_mismatch_index]
+                                     << "\n";
+                            std::cerr << mismatch.str();
                         }
                         int global_errors { 0 };
                         MPI_Allreduce(&local_errors, &global_errors, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);

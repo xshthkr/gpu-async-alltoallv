@@ -105,6 +105,11 @@ static void ensure_slot_capacity(
 	size_t extra_bytes, size_t temp_recv_bytes,
 	size_t chunk_recv_bytes, bool use_hugepages)
 {
+	if (send_bytes == 0) send_bytes = 1;
+	if (extra_bytes == 0) extra_bytes = 1;
+	if (temp_recv_bytes == 0) temp_recv_bytes = 1;
+	if (chunk_recv_bytes == 0) chunk_recv_bytes = 1;
+
 	if (send_bytes > slot->send_buffer_capacity) {
 		if (slot->send_buffer) servlet_free(slot->send_buffer);
 		slot->send_buffer = (char*) servlet_malloc(send_bytes, use_hugepages);
