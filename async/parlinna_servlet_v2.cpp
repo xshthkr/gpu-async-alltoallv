@@ -243,8 +243,8 @@ static int run_phase1_chunk(
 				offset += updated_sentcounts[send_index] * typesize;
 			}
 
-			int recv_proc { gid * n + (grank + spoint) % n };
-			int send_proc { gid * n + (grank - spoint + n) % n };
+			int recv_proc { (grank + spoint) % n };
+			int send_proc { (grank - spoint + n) % n };
 			et = MPI_Wtime();
 			prepData_time += et - st;
 
