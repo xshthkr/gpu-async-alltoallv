@@ -180,6 +180,15 @@ int main(int argc, char **argv) {
                     long long *recv_srv = new long long[roffset];
                     std::memset(recv_srv, 0, roffset * sizeof(long long));
 
+                        if (rank == 0) {
+                            std::cout << "[DEBUG case] n=" << ncores
+                                      << " msg_size=" << msg_size
+                                      << " chunks=" << num_chunks
+                                      << " bsize=" << bsize
+                                      << " radix=" << radix
+                                      << std::endl;
+                            std::cout.flush();
+                        }
                         MPI_Barrier(MPI_COMM_WORLD);
                         t0 = MPI_Wtime();
                         async_rbruck_alltoallv::ParLinNa_servlet_v2(
