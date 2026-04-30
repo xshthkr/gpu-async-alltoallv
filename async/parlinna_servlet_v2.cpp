@@ -412,11 +412,17 @@ int ParLinNa_servlet_v2(
 	int ngroup { nprocs / n };
 	int sw { static_cast<int>(ceil(log(n) / float(log(r)))) };
 
-	MPI_Comm node_id_comm;
-	MPI_Comm_split(comm, local_rank, rank, &node_id_comm);
-	int gid { 0 };
-	MPI_Comm_rank(node_id_comm, &gid);
-	MPI_Comm_free(&node_id_comm);
+	MPI_Comm node_leader_comm = MPI_COMM_NULL;
+	MPI_Comm_split(comm, (local_rank == 0) ? 0 : MPI_UNDEFINED, rank, &node_leader_comm);
+	int node_id { 0 };
+	if (local_rank == 0) {
+		MPI_Comm_rank(node_leader_comm, &node_id);
+	}
+	MPI_Bcast(&node_id, 1, MPI_INT, 0, local_comm);
+	int gid { node_id };
+	if (node_leader_comm != MPI_COMM_NULL) {
+		MPI_Comm_free(&node_leader_comm);
+	}
 
 	et = MPI_Wtime();
 	init_time += et - st;
