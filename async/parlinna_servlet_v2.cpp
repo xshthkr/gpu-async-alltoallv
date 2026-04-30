@@ -485,6 +485,9 @@ int ParLinNa_servlet_v2(
 				chunk_recvcounts, chunk_total_recv * typesize,
 				recvbuf, recvcounts, rdispls, c, num_chunks,
 				comm, local_comm, bblock, slot, servlet_ctx);
+		if (n == 2 && bblock == 2 && num_chunks == 8) {
+			fprintf(stderr, "[DBG ParLinNa] submit chunk=%d slot=%d\n", c, slot_idx);
+		}
 		st = MPI_Wtime();
 		servlet_submit(servlet_ctx);
 		et = MPI_Wtime();
@@ -493,6 +496,9 @@ int ParLinNa_servlet_v2(
 
 	// wait for all in-flight chunks to complete
 	servlet_wait(servlet_ctx);
+	if (n == 2 && bblock == 2 && num_chunks == 8) {
+		fprintf(stderr, "[DBG ParLinNa] final servlet_wait complete\n");
+	}
 	for (int s { 0 }; s < NUM_SLOTS; s++) {
 		scatter_chunk_recv_buffer(&servlet_ctx->slots[s]);
 	}

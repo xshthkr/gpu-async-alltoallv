@@ -211,6 +211,10 @@ static void *servlet_thread_fn(void *arg) {
                 did_work = true;
                 backoff_us = 0;
 
+                if (ctx->slots[s].desc.n == 2 && ctx->slots[s].desc.bblock == 2 && ctx->slots[s].desc.ngroup == 2) {
+                    fprintf(stderr, "[DBG servlet] executing slot %d gid=%d grank=%d\n", s, ctx->slots[s].desc.gid, ctx->slots[s].desc.grank);
+                }
+
                 double t0 { MPI_Wtime() };
                 ctx->slots[s].post_time = 0;
                 ctx->slots[s].progress_time = 0;
@@ -218,6 +222,10 @@ static void *servlet_thread_fn(void *arg) {
                 execute_transfers(&ctx->slots[s], &ctx->config);
 
                 ctx->slots[s].total_time = MPI_Wtime() - t0;
+
+                if (ctx->slots[s].desc.n == 2 && ctx->slots[s].desc.bblock == 2 && ctx->slots[s].desc.ngroup == 2) {
+                    fprintf(stderr, "[DBG servlet] completed slot %d\n", s);
+                }
 
                 /* signal completion */
                 ctx->slots[s].state.store(static_cast<int>(ServletState::DONE), std::memory_order_release);
